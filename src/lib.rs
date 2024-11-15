@@ -4,8 +4,7 @@ use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast,
-        ast::{Decl, Expr, Ident, Program },
+        ast::{self, Decl, Expr, Ident, Program},
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
@@ -33,6 +32,51 @@ impl TransformVisitor {
             states: HashSet::new(),
         }
     }
+
+    fn handle_func(&mut self, node: &mut ast::BlockStmt) {
+        for inner_stmt in &mut node.stmts {
+            if let ast::Stmt::Decl(Decl::Var(var_decl)) = &mut *inner_stmt {
+                for decl in &mut var_decl.decls {
+                    if let (ast::Pat::Ident(name_ident), Some(expr)) = (&mut decl.name, &mut decl.init) {
+                        let ident = name_ident.clone();
+
+                        if let Expr::Call(call_expr) = &mut **expr {
+                            if let ast::Callee::Expr(callee) = &mut call_expr.callee {
+                                if let Expr::Ident(callee_ident) = &mut **callee{
+                                    if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
+                                        decl.name = ast::Pat::Array(ast::ArrayPat {
+                                            span: ident.span(),
+                                            optional: false,
+                                            type_ann: None,
+                                            elems: vec![
+                                                Some(ast::Pat::Ident(ast::BindingIdent {
+                                                    id: Ident::new(ident.sym.clone().into(), DUMMY_SP, ident.ctxt),
+                                                    type_ann: None,
+                                                })),
+                                                Some(ast::Pat::Ident(ast::BindingIdent {
+                                                    id: Ident::new(format!("set{}", capitalize_first(&ident.sym)).into(), ident.span, ident.ctxt),
+                                                    type_ann: None,
+                                                })),
+                                            ],
+                                        });
+                                        decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
+                                            callee: ast::Callee::Expr(
+                                                Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
+                                            args: vec![call_expr.args[0].clone().into()],
+                                            type_args: None,
+                                            span: expr.span(),
+                                            ..Default::default()
+                                        })));
+                                        self.states.insert(ident.sym.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl VisitMut for TransformVisitor {
@@ -40,13 +84,7 @@ impl VisitMut for TransformVisitor {
     // A comprehensive list of possible visitor methods can be found here:
     // https://rustdoc.swc.rs/swc_ecma_visit/trait.VisitMut.html
 
-    // fn visit_mut_update_expr(&mut self, _node: &mut swc_core::ecma::ast::UpdateExpr) {
-    // }
-
-    // fn visit_mut_var_decl(&mut self, node: &mut VarDecl) {
-    // }
-
-    fn visit_mut_module(&mut self, node: &mut swc_core::ecma::ast::Module) {
+    fn visit_mut_module(&mut self, node: &mut ast::Module) {
         Vec::insert(&mut node.body, 0, 
             ast::ModuleItem::ModuleDecl(ast::ModuleDecl::Import(ast::ImportDecl {
                 span: DUMMY_SP,
@@ -76,56 +114,33 @@ impl VisitMut for TransformVisitor {
         node.visit_mut_children_with(self);
     }
 
+    fn visit_mut_export_default_decl(&mut self, node: &mut ast::ExportDefaultDecl) {
+        if let ast::DefaultDecl::Fn(func) = &mut node.decl {
+            if let Some(body) = &mut func.function.body {
+                self.handle_func(body);
+            }
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_export_decl(&mut self, node: &mut ast::ExportDecl) {
+        if let Decl::Fn(func) = &mut node.decl {
+            if let Some(body) = &mut func.function.body {
+                self.handle_func(body);
+            }
+        }
+        node.visit_mut_children_with(self);
+    }
+
     fn visit_mut_module_item(&mut self, item: &mut ast::ModuleItem) {
         if let ast::ModuleItem::Stmt(stmt) = item {
             if let ast::Stmt::Decl(Decl::Fn(func)) = stmt {
                 if let Some(body) = &mut func.function.body {
-                    for inner_stmt in &mut body.stmts {
-                        if let ast::Stmt::Decl(Decl::Var(var_decl)) = &mut *inner_stmt {
-                            for decl in &mut var_decl.decls {
-                                if let (ast::Pat::Ident(name_ident), Some(expr)) = (&mut decl.name, &mut decl.init) {
-                                    let ident = name_ident.clone();
-
-                                    if let Expr::Call(call_expr) = &mut **expr {
-                                        if let ast::Callee::Expr(callee) = &mut call_expr.callee {
-                                            if let Expr::Ident(callee_ident) = &mut **callee{
-                                                if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
-                                                    decl.name = ast::Pat::Array(ast::ArrayPat {
-                                                        span: ident.span(),
-                                                        optional: false,
-                                                        type_ann: None,
-                                                        elems: vec![
-                                                            Some(ast::Pat::Ident(ast::BindingIdent {
-                                                                id: Ident::new(ident.sym.clone().into(), DUMMY_SP, ident.ctxt),
-                                                                type_ann: None,
-                                                            })),
-                                                            Some(ast::Pat::Ident(ast::BindingIdent {
-                                                                id: Ident::new(format!("set{}", capitalize_first(&ident.sym)).into(), ident.span, ident.ctxt),
-                                                                type_ann: None,
-                                                            })),
-                                                        ],
-                                                    });
-                                                    decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
-                                                        callee: ast::Callee::Expr(
-                                                            Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
-                                                        args: vec![call_expr.args[0].clone().into()],
-                                                        type_args: None,
-                                                        span: expr.span(),
-                                                        ..Default::default()
-                                                    })));
-                                                    self.states.insert(ident.sym.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.handle_func(body);
                 }
-                item.visit_mut_children_with(self);
             }
         }
+        item.visit_mut_children_with(self);
     }
 
     fn visit_mut_arrow_expr(&mut self, node: &mut ast::ArrowExpr) {
@@ -201,7 +216,38 @@ test_inline!(
     const count = $state(0);
 }"#,
     // Output codes after transformed with plugin
-    r#"function App() {
+    r#"import { useState } from "react";
+function App() {
+    const [count, setCount] = useState(0);
+}"#
+);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    export,
+    // Input codes
+    r#"export function App() {
+    const count = $state(0);
+}"#,
+    // Output codes after transformed with plugin
+    r#"import { useState } from "react";
+export function App() {
+    const [count, setCount] = useState(0);
+}"#
+);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    default_export,
+    // Input codes
+    r#"export default function App() {
+    const count = $state(0);
+}"#,
+    // Output codes after transformed with plugin
+    r#"import { useState } from "react";
+export default function App() {
     const [count, setCount] = useState(0);
 }"#
 );
@@ -215,7 +261,8 @@ test_inline!(
     const state = $state({foo: 1, bar: []});
 }"#,
     // Output codes after transformed with plugin
-    r#"function App() {
+    r#"import { useState } from "react";
+function App() {
     const [state, setState] = useState({foo: 1, bar: []});
 }"#
 );
@@ -231,7 +278,8 @@ test_inline!(
   return null;
 }"#,
     // Output codes after transformed with plugin
-    r#"function App() {
+    r#"import { useState } from "react";
+function App() {
     let [count, setCount] = useState(0);
     let clickHandler = () => {
         count += 1;
