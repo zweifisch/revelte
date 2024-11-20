@@ -1,6 +1,6 @@
 # revelte
 
-`$state()` for react, WIP
+`$state()` and `$effect()` for react, WIP
 
 ```jsx
 function App() {

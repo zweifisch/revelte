@@ -1,88 +1,245 @@
 use std::collections::HashSet;
 
+mod util;
+
 use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, Decl, Expr, Ident, Program},
+        ast::{self, Decl, Expr, ExprOrSpread, Ident, MemberExpr, MemberProp, Program},
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
 use swc_core::plugin::{
     plugin_transform,
     proxies::TransformPluginProgramMetadata};
+use util::find_declared;
 
 
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    if let Some(first_char) = chars.next() {
-        format!("{}{}", first_char.to_uppercase(), chars.as_str())
+#[derive(Debug, Clone, Eq)]
+enum Dep {
+    Ident(ast::Ident),
+    MemberExpr(ast::MemberExpr),
+}
+
+fn find_root(expr: &MemberExpr) -> Option<ast::Ident> {
+    if let Expr::Member(obj) = &*expr.obj {
+        find_root(&obj)
     } else {
-        String::new()
+        if let Expr::Ident(ident) = &*expr.obj {
+            Some(ident.clone())
+        } else {
+            None
+        }
+    }
+}
+
+fn to_string(expr: &MemberExpr) -> String {
+    let prefix = match &*expr.obj {
+        Expr::Member(obj) => {
+            to_string(&obj)
+        }
+        Expr::Ident(ident) => {
+            ident.to_string()
+        }
+        _ => "".into()
+    };
+    let prop = match &expr.prop {
+        MemberProp::Ident(ident) => ident.to_string(),
+        MemberProp::Computed(prop) => {
+            match &*prop.expr {
+                Expr::Lit(x) => {
+                    match x {
+                        ast::Lit::Str(x) => x.value.to_string(),
+                        ast::Lit::Num(number) => number.to_string(),
+                        _ => "".into(),
+                    }
+                },
+                _ => "".into(),
+            }
+        }
+        _ => "".into(),
+    };
+    format!("{}.{}", prefix, prop)
+}
+
+impl std::hash::Hash for Dep {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Dep::Ident(ident) => ident.to_id().hash(state),
+            Dep::MemberExpr(expr) => to_string(expr).hash(state),
+        }
+    }
+}
+
+impl PartialEq for Dep {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Dep::Ident(ident), Dep::Ident(ident2)) => ident.to_string() == ident2.to_string(),
+            (Dep::MemberExpr(expr), Dep::MemberExpr(expr2)) => to_string(expr) == to_string(expr2),
+            (_, _) => false
+        }
     }
 }
 
 pub struct TransformVisitor {
-    states: HashSet<String>,
+    declared: Vec<HashSet<Atom>>,
+    deps: Vec<HashSet<Dep>>,
+    last_deps: HashSet<Dep>,
+    member: Option<ast::MemberExpr>,
 }
 
 impl TransformVisitor {
     fn new() -> Self {
+        let mut declared = Vec::new();
+        declared.push(HashSet::new());
+        let mut deps= Vec::new();
+        deps.push(HashSet::new());
         Self {
-            states: HashSet::new(),
+            declared: declared,
+            deps: deps,
+            last_deps: HashSet::new(),
+            member: None,
         }
     }
 
-    fn handle_func(&mut self, node: &mut ast::BlockStmt) {
-        for inner_stmt in &mut node.stmts {
-            if let ast::Stmt::Decl(Decl::Var(var_decl)) = &mut *inner_stmt {
-                for decl in &mut var_decl.decls {
-                    if let (ast::Pat::Ident(name_ident), Some(expr)) = (&mut decl.name, &mut decl.init) {
-                        let ident = name_ident.clone();
-
-                        if let Expr::Call(call_expr) = &mut **expr {
-                            if let ast::Callee::Expr(callee) = &mut call_expr.callee {
-                                if let Expr::Ident(callee_ident) = &mut **callee{
-                                    if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
-                                        decl.name = ast::Pat::Array(ast::ArrayPat {
-                                            span: ident.span(),
-                                            optional: false,
-                                            type_ann: None,
-                                            elems: vec![
-                                                Some(ast::Pat::Ident(ast::BindingIdent {
-                                                    id: Ident::new(ident.sym.clone().into(), DUMMY_SP, ident.ctxt),
-                                                    type_ann: None,
-                                                })),
-                                                Some(ast::Pat::Ident(ast::BindingIdent {
-                                                    id: Ident::new(format!("set{}", capitalize_first(&ident.sym)).into(), ident.span, ident.ctxt),
-                                                    type_ann: None,
-                                                })),
-                                            ],
-                                        });
-                                        decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
-                                            callee: ast::Callee::Expr(
-                                                Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
-                                            args: vec![call_expr.args[0].clone().into()],
-                                            type_args: None,
-                                            span: expr.span(),
-                                            ..Default::default()
-                                        })));
-                                        self.states.insert(ident.sym.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    fn push_scope(&mut self) {
+        self.declared.push(HashSet::new());
+        self.deps.push(HashSet::new());
     }
+
+    fn pop_scope(&mut self) {
+        self.declared.pop();
+        self.last_deps = self.deps.pop().unwrap();
+        // println!("{:?} {:?}", self.declared.pop(), self.deps.pop());
+    }
+
+    fn add_to_scope(&mut self, name: Atom) {
+        let mut last = self.declared.pop().unwrap();
+        last.insert(name);
+        self.declared.push(last);
+    }
+
+    fn add_to_deps(&mut self, name: Dep) {
+        let mut last = self.deps.pop().unwrap();
+        last.insert(name);
+        self.deps.push(last);
+    }
+
+    fn current_deps(&mut self) -> &HashSet<Dep> {
+        self.deps.last().unwrap()
+    }
+
+    fn current_scope(&mut self) -> &HashSet<Atom> {
+        self.declared.last().unwrap()
+    }
+
+    fn declared_in_parent_scope(&mut self, name: &Atom) -> bool {
+        if self.current_scope().contains(name) {
+            return false
+        }
+        if self.declared.len() > 1 {
+            return self.declared[self.declared.len() - 2].contains(name)
+        }
+        return false
+    }
+
 }
 
 impl VisitMut for TransformVisitor {
-    // Implement necessary visit_mut_* methods for actual custom transform.
-    // A comprehensive list of possible visitor methods can be found here:
-    // https://rustdoc.swc.rs/swc_ecma_visit/trait.VisitMut.html
+
+    fn visit_mut_ident(&mut self, node: &mut Ident) {
+        // println!("{:?}", node.to_id());
+        if self.declared_in_parent_scope(&node.sym.clone()) {
+            self.add_to_deps(Dep::Ident(node.clone()));
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_member_expr(&mut self, node: &mut ast::MemberExpr) {
+        if self.member == None {
+            self.member = Some(node.clone());
+        }
+        match &node.prop {
+            MemberProp::Computed(prop) => {
+                match &*prop.expr {
+                    Expr::Lit(_) => {}
+                    _ => {
+                        self.member = None;
+                    }
+                }
+            }
+            MemberProp::Ident(_) => {
+                match &*node.obj {
+                    ast::Expr::Ident(ident) => {
+                        // println!("done {:?}", self.member);
+                        if self.declared_in_parent_scope(&ident.sym.clone()) {
+                            self.add_to_deps(Dep::MemberExpr(self.member.to_owned().unwrap()));
+                        }
+                        self.member = None;
+                        return
+                    }
+                    ast::Expr::Member(_) => { }
+                    _ => {
+                        self.member = None;
+                    }
+                }
+            },
+            MemberProp::PrivateName(_) => {},
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_assign_expr(&mut self, node: &mut ast::AssignExpr) {
+        match &node.left {
+            ast::AssignTarget::Simple(target) => {
+                match target {
+                    ast::SimpleAssignTarget::Ident(ident) => self.add_to_scope(ident.sym.clone()),
+                    ast::SimpleAssignTarget::Member(member_expr) => todo!(),
+                    _ => {},
+                }
+            }
+            ast::AssignTarget::Pat(pat) => {
+                match pat {
+                    ast::AssignTargetPat::Array(array) => {
+                        for declared in util::find_declared(&ast::Pat::Array(array.clone())) {
+                            self.add_to_scope(declared);
+                        }
+                    }
+                    ast::AssignTargetPat::Object(obj) => {
+                        for declared in util::find_declared(&ast::Pat::Object(obj.clone())) {
+                            self.add_to_scope(declared);
+                        }
+                    }
+                    ast::AssignTargetPat::Invalid(_) => {}
+                }
+
+            }
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_decl(&mut self, node: &mut Decl) {
+        match node {
+            Decl::Class(cls) => {
+                self.push_scope();
+                self.add_to_scope(cls.ident.sym.clone());
+                self.pop_scope();
+            }
+            Decl::Fn(f) => {
+                self.add_to_scope(f.ident.sym.clone());
+            }
+            Decl::Var(v) => {
+                for decl in &v.decls {
+                    for name in util::find_declared(&decl.name) {
+                        self.add_to_scope(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        node.visit_mut_children_with(self);
+    }
 
     fn visit_mut_module(&mut self, node: &mut ast::Module) {
         Vec::insert(&mut node.body, 0, 
@@ -114,36 +271,50 @@ impl VisitMut for TransformVisitor {
         node.visit_mut_children_with(self);
     }
 
-    fn visit_mut_export_default_decl(&mut self, node: &mut ast::ExportDefaultDecl) {
-        if let ast::DefaultDecl::Fn(func) = &mut node.decl {
-            if let Some(body) = &mut func.function.body {
-                self.handle_func(body);
+    // fn visit_mut_export_default_decl(&mut self, node: &mut ast::ExportDefaultDecl) {
+    //     if let ast::DefaultDecl::Fn(func) = &mut node.decl {
+    //         if let Some(body) = &mut func.function.body {
+    //         }
+    //     }
+    //     node.visit_mut_children_with(self);
+    // }
+
+    // fn visit_mut_export_decl(&mut self, node: &mut ast::ExportDecl) {
+    //     if let Decl::Fn(func) = &mut node.decl {
+    //         if let Some(body) = &mut func.function.body {
+    //         }
+    //     }
+    //     node.visit_mut_children_with(self);
+    // }
+
+    // fn visit_mut_module_item(&mut self, item: &mut ast::ModuleItem) {
+    //     if let ast::ModuleItem::Stmt(stmt) = item {
+    //         if let ast::Stmt::Decl(Decl::Fn(func)) = stmt {
+    //             if let Some(body) = &mut func.function.body {
+    //             }
+    //         }
+    //     }
+    //     item.visit_mut_children_with(self);
+    // }
+
+    fn visit_mut_function(&mut self, node: &mut ast::Function) {
+        self.push_scope();
+        for param in &node.params {
+            for name in util::find_declared(&param.pat) {
+                self.add_to_scope(name.clone());
             }
         }
         node.visit_mut_children_with(self);
-    }
-
-    fn visit_mut_export_decl(&mut self, node: &mut ast::ExportDecl) {
-        if let Decl::Fn(func) = &mut node.decl {
-            if let Some(body) = &mut func.function.body {
-                self.handle_func(body);
-            }
-        }
-        node.visit_mut_children_with(self);
-    }
-
-    fn visit_mut_module_item(&mut self, item: &mut ast::ModuleItem) {
-        if let ast::ModuleItem::Stmt(stmt) = item {
-            if let ast::Stmt::Decl(Decl::Fn(func)) = stmt {
-                if let Some(body) = &mut func.function.body {
-                    self.handle_func(body);
-                }
-            }
-        }
-        item.visit_mut_children_with(self);
+        self.pop_scope();
     }
 
     fn visit_mut_arrow_expr(&mut self, node: &mut ast::ArrowExpr) {
+        self.push_scope();
+        for param in &node.params {
+            for name in util::find_declared(&param) {
+                self.add_to_scope(name.clone());
+            }
+        }
         let mut body = node.body.clone();
         if let ast::BlockStmtOrExpr::Expr(expr) = &mut *body {
             let mut expr1 = expr.clone();
@@ -151,7 +322,7 @@ impl VisitMut for TransformVisitor {
                 if let ast::AssignTarget::Simple(target) = &mut assign_expr.left {
                     if let ast::SimpleAssignTarget::Ident(ident) = target {
                         node.body = Box::new(ast::BlockStmtOrExpr::BlockStmt(ast::BlockStmt {
-                            ctxt: ident.ctxt,
+                            ctxt: SyntaxContext::empty(),
                             span: expr.span(),
                             stmts: vec![
                                 ast::Stmt::Expr(ast::ExprStmt {
@@ -163,7 +334,7 @@ impl VisitMut for TransformVisitor {
                                     expr: Box::new(Expr::Call(ast::CallExpr {
                                                 callee: ast::Callee::Expr(
                                                     Box::new(Expr::Ident(
-                                                        Ident::new(format!("set{}", capitalize_first(&ident.sym)).into(), expr.span(), ident.ctxt)))),
+                                                        Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), expr.span(), SyntaxContext::empty())))),
                                                 args: vec![
                                                     ast::ExprOrSpread {
                                                         spread: None,
@@ -180,6 +351,81 @@ impl VisitMut for TransformVisitor {
             }
         };
         node.visit_mut_children_with(self);
+        self.pop_scope();
+    }
+
+    fn visit_mut_call_expr(&mut self, node: &mut ast::CallExpr) {
+        node.visit_mut_children_with(self);
+        if let ast::Callee::Expr(callee) = &mut node.callee {
+            if let Expr::Ident(callee_ident) = &mut **callee{
+                if callee_ident.sym == "$effect" && node.args.len() == 1 {
+                    callee_ident.sym = "useEffect".into();
+                    // println!("deps {:?}", &self.last_deps);
+                    node.args = vec![
+                        node.args[0].clone().into(),
+                        ExprOrSpread {
+                            spread: None,
+                            expr: Box::new(Expr::Array(ast::ArrayLit {
+                                span: DUMMY_SP,
+                                elems: self.last_deps.clone().into_iter().map(|x| Some(ExprOrSpread {
+                                    spread: None,
+                                    expr: Box::new(
+                                        match x {
+                                            Dep::Ident(x) => Expr::Ident(x),
+                                            Dep::MemberExpr(x) => Expr::Member(x),
+                                        })
+                                })).collect(),
+                            }))
+                        }
+                    ];
+                }
+            }
+        }
+    }
+
+    fn visit_mut_block_stmt(&mut self, node: &mut ast::BlockStmt) {
+        node.visit_mut_children_with(self);
+        for inner_stmt in &mut node.stmts {
+            if let ast::Stmt::Decl(Decl::Var(var_decl)) = &mut *inner_stmt {
+                for decl in &mut var_decl.decls {
+                    if let (ast::Pat::Ident(name_ident), Some(expr)) = (&mut decl.name, &mut decl.init) {
+                        let ident = name_ident.clone();
+
+                        if let Expr::Call(call_expr) = &mut **expr {
+                            if let ast::Callee::Expr(callee) = &mut call_expr.callee {
+                                if let Expr::Ident(callee_ident) = &mut **callee{
+                                    if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
+                                        decl.name = ast::Pat::Array(ast::ArrayPat {
+                                            span: ident.span(),
+                                            optional: false,
+                                            type_ann: None,
+                                            elems: vec![
+                                                Some(ast::Pat::Ident(ast::BindingIdent {
+                                                    id: Ident::new(ident.sym.clone().into(), DUMMY_SP, name_ident.ctxt),
+                                                    type_ann: None,
+                                                })),
+                                                Some(ast::Pat::Ident(ast::BindingIdent {
+                                                    id: Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), ident.span, name_ident.ctxt),
+                                                    type_ann: None,
+                                                })),
+                                            ],
+                                        });
+                                        decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
+                                            callee: ast::Callee::Expr(
+                                                Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
+                                            args: vec![call_expr.args[0].clone().into()],
+                                            type_args: None,
+                                            span: expr.span(),
+                                            ..Default::default()
+                                        })));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -211,11 +457,9 @@ test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
     use_state,
-    // Input codes
     r#"function App() {
     const count = $state(0);
 }"#,
-    // Output codes after transformed with plugin
     r#"import { useState } from "react";
 function App() {
     const [count, setCount] = useState(0);
@@ -226,11 +470,9 @@ test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
     export,
-    // Input codes
     r#"export function App() {
     const count = $state(0);
 }"#,
-    // Output codes after transformed with plugin
     r#"import { useState } from "react";
 export function App() {
     const [count, setCount] = useState(0);
@@ -241,11 +483,9 @@ test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
     default_export,
-    // Input codes
     r#"export default function App() {
     const count = $state(0);
 }"#,
-    // Output codes after transformed with plugin
     r#"import { useState } from "react";
 export default function App() {
     const [count, setCount] = useState(0);
@@ -256,11 +496,9 @@ test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
     object,
-    // Input codes
     r#"function App() {
     const state = $state({foo: 1, bar: []});
 }"#,
-    // Output codes after transformed with plugin
     r#"import { useState } from "react";
 function App() {
     const [state, setState] = useState({foo: 1, bar: []});
@@ -271,13 +509,11 @@ test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
     component,
-    // Input codes
     r#"function App() {
   let count = $state(0);
   let clickHandler = () => count += 1;
   return null;
 }"#,
-    // Output codes after transformed with plugin
     r#"import { useState } from "react";
 function App() {
     let [count, setCount] = useState(0);
@@ -285,6 +521,53 @@ function App() {
         count += 1;
         setCount(count);
     }
+    return null;
+}"#
+);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    effect,
+    r#"function App() {
+  let pageTitle = $state("");
+  $effect(() => {
+    pageTitle = document.title;
+  });
+  return null;
+}"#,
+    r#"import { useState } from "react";
+function App() {
+    let [pageTitle, setPageTitle] = useState("");
+    useEffect(() => {
+      pageTitle = document.title;
+    }, [])
+    return null;
+}"#
+);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    effect_with_deps,
+    r#"function App(props) {
+  let data = $state({});
+  $effect(() => {
+    console.log(props.url)
+    fetch(props.url.toString()).then(x => x.json()).then(val => data = val)
+  });
+  return null;
+}"#,
+    r#"import { useState } from "react";
+function App(props) {
+    let [data, setData] = useState({});
+    useEffect(() => {
+      console.log(props.url)
+      fetch(props.url.toString()).then(x => x.json()).then(val => {
+        data = val
+        setData(data)
+      })
+    }, [props.url, props.url.toString])
     return null;
 }"#
 );
