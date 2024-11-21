@@ -1,12 +1,13 @@
-use std::collections::HashSet;
-
 mod util;
+mod dep;
 
+use std::collections::HashSet;
+use dep::Dep;
 use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, Decl, Expr, ExprOrSpread, Ident, MemberExpr, MemberProp, Program},
+        ast::{self, Decl, Expr, ExprOrSpread, Ident, Program},
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
@@ -14,60 +15,6 @@ use swc_core::plugin::{
     plugin_transform,
     proxies::TransformPluginProgramMetadata};
 
-
-#[derive(Debug, Clone, Eq)]
-enum Dep {
-    Ident(ast::Ident),
-    MemberExpr(ast::MemberExpr),
-}
-
-fn to_string(expr: &MemberExpr) -> String {
-    let prefix = match &*expr.obj {
-        Expr::Member(obj) => {
-            to_string(&obj)
-        }
-        Expr::Ident(ident) => {
-            ident.to_string()
-        }
-        _ => "".into()
-    };
-    let prop = match &expr.prop {
-        MemberProp::Ident(ident) => ident.to_string(),
-        MemberProp::Computed(prop) => {
-            match &*prop.expr {
-                Expr::Lit(x) => {
-                    match x {
-                        ast::Lit::Str(x) => x.value.to_string(),
-                        ast::Lit::Num(number) => number.to_string(),
-                        _ => "".into(),
-                    }
-                },
-                _ => "".into(),
-            }
-        }
-        _ => "".into(),
-    };
-    format!("{}.{}", prefix, prop)
-}
-
-impl std::hash::Hash for Dep {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            Dep::Ident(ident) => ident.to_id().hash(state),
-            Dep::MemberExpr(expr) => to_string(expr).hash(state),
-        }
-    }
-}
-
-impl PartialEq for Dep {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Dep::Ident(ident), Dep::Ident(ident2)) => ident.to_string() == ident2.to_string(),
-            (Dep::MemberExpr(expr), Dep::MemberExpr(expr2)) => to_string(expr) == to_string(expr2),
-            (_, _) => false
-        }
-    }
-}
 
 pub struct TransformVisitor {
     declared: Vec<HashSet<Atom>>,
@@ -144,7 +91,7 @@ impl VisitMut for TransformVisitor {
             self.member = Some(node.clone());
         }
         match &node.prop {
-            MemberProp::Computed(prop) => {
+            ast::MemberProp::Computed(prop) => {
                 match &*prop.expr {
                     Expr::Lit(_) => {}
                     _ => {
@@ -152,7 +99,7 @@ impl VisitMut for TransformVisitor {
                     }
                 }
             }
-            MemberProp::Ident(_) => {
+            ast::MemberProp::Ident(_) => {
                 match &*node.obj {
                     ast::Expr::Ident(ident) => {
                         // println!("done {:?}", self.member);
@@ -168,7 +115,7 @@ impl VisitMut for TransformVisitor {
                     }
                 }
             },
-            MemberProp::PrivateName(_) => {},
+            ast::MemberProp::PrivateName(_) => {},
         }
         node.visit_mut_children_with(self);
     }
@@ -412,30 +359,11 @@ impl VisitMut for TransformVisitor {
     }
 }
 
-/// An example plugin function with macro support.
-/// `plugin_transform` macro interop pointers into deserialized structs, as well
-/// as returning ptr back to host.
-///
-/// It is possible to opt out from macro by writing transform fn manually
-/// if plugin need to handle low-level ptr directly via
-/// `__transform_plugin_process_impl(
-///     ast_ptr: *const u8, ast_ptr_len: i32,
-///     unresolved_mark: u32, should_enable_comments_proxy: i32) ->
-///     i32 /*  0 for success, fail otherwise.
-///             Note this is only for internal pointer interop result,
-///             not actual transform result */`
-///
-/// This requires manual handling of serialization / deserialization from ptrs.
-/// Refer swc_plugin_macro to see how does it work internally.
 #[plugin_transform]
 pub fn process_transform(program: Program, _metadata: TransformPluginProgramMetadata) -> Program {
     program.fold_with(&mut as_folder(TransformVisitor::new()))
 }
 
-// An example to test plugin transform.
-// Recommended strategy to test plugin's transform is verify
-// the Visitor's behavior, instead of trying to run `process_transform` with mocks
-// unless explicitly required to do so.
 test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
@@ -491,7 +419,7 @@ function App() {
 test_inline!(
     Default::default(),
     |_| as_folder(TransformVisitor::new()),
-    component,
+    assign,
     r#"function App() {
   let count = $state(0);
   let clickHandler = () => count += 1;

@@ -55,3 +55,124 @@ pub fn find_declared(pat: &ast::Pat) -> HashSet<Atom> {
     }
     deps
 }
+
+pub fn member_expr_to_string(expr: &ast::MemberExpr) -> String {
+    let prefix = match &*expr.obj {
+        ast::Expr::Member(obj) => {
+            member_expr_to_string(&obj)
+        }
+        ast::Expr::Ident(ident) => {
+            ident.sym.to_string()
+        }
+        _ => "".into()
+    };
+    let prop = match &expr.prop {
+        ast::MemberProp::Ident(ident) => format!(".{}", ident.sym),
+        ast::MemberProp::Computed(prop) => {
+            match &*prop.expr {
+                ast::Expr::Lit(x) => {
+                    match x {
+                        ast::Lit::Str(x) => format!("['{}']", x.value),
+                        ast::Lit::Num(number) => format!("[{}]", number),
+                        _ => "".into(),
+                    }
+                },
+                ast::Expr::Ident(ident) => format!("[{}]", ident.sym),
+                _ => "".into(),
+            }
+        }
+        _ => "".into(),
+    };
+    format!("{}{}", prefix, prop)
+}
+
+#[cfg(test)]
+mod tests {
+    use ast::*;
+    use swc_core::common::{SyntaxContext, DUMMY_SP};
+
+    use super::*;
+
+    #[test]
+    fn member() {
+        let result = member_expr_to_string(&MemberExpr{
+            span: DUMMY_SP,
+            prop: MemberProp::Ident(IdentName {
+                span: DUMMY_SP,
+                sym: "c".into()
+            }),
+            obj: Box::new(Expr::Member(MemberExpr {
+                span: DUMMY_SP,
+                prop: MemberProp::Ident(IdentName {
+                    span: DUMMY_SP,
+                    sym: "b".into()
+                }),
+                obj: Box::new(Expr::Ident(Ident {
+                    span: DUMMY_SP,
+                    ctxt: SyntaxContext::empty(),
+                    sym: "a".into(),
+                    optional: false
+                })),
+            })),
+        });
+        assert_eq!(result, "a.b.c");
+    }
+
+    #[test]
+    fn member_lit() {
+        let result = member_expr_to_string(&MemberExpr{
+            span: DUMMY_SP,
+            prop: MemberProp::Computed(ComputedPropName {
+                span: DUMMY_SP,
+                expr: Box::new(Expr::Lit(Lit::Str("b c".into())))
+            }),
+            obj: Box::new(Expr::Ident(Ident {
+                span: DUMMY_SP,
+                ctxt: SyntaxContext::empty(),
+                sym: "a".into(),
+                optional: false
+            })),
+        });
+        assert_eq!(result, "a['b c']");
+    }
+
+    #[test]
+    fn member_number_indice() {
+        let result = member_expr_to_string(&MemberExpr{
+            span: DUMMY_SP,
+            prop: MemberProp::Computed(ComputedPropName {
+                span: DUMMY_SP,
+                expr: Box::new(Expr::Lit( Lit::Num(0.into())))
+            }),
+            obj: Box::new(Expr::Ident(Ident {
+                span: DUMMY_SP,
+                ctxt: SyntaxContext::empty(),
+                sym: "a".into(),
+                optional: false
+            })),
+        });
+        assert_eq!(result, "a[0]");
+    }
+
+    #[test]
+    fn member_computed() {
+        let result = member_expr_to_string(&MemberExpr{
+            span: DUMMY_SP,
+            prop: MemberProp::Ident("c".into()),
+            obj: Box::new(Expr::Member(MemberExpr {
+                span: DUMMY_SP,
+                prop: MemberProp::Computed(ComputedPropName {
+                    span: DUMMY_SP,
+                    expr: Box::new(Expr::Ident("b".into()))
+                }),
+                obj: Box::new(Expr::Ident(Ident {
+                    span: DUMMY_SP,
+                    ctxt: SyntaxContext::empty(),
+                    sym: "a".into(),
+                    optional: false
+                })),
+            })),
+        });
+        assert_eq!(result, "a[b].c");
+    }
+}
