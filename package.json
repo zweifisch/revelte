@@ -1,6 +1,6 @@
 {
     "name": "revelte",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "",
     "author": "",
     "license": "ISC",
@@ -10,6 +10,6 @@
     "scripts": {
         "prepublishOnly": "cargo build-wasi --release"
     },
-    "files": [],
+    "files": ["type.d.ts"],
     "preferUnplugged": true
 }
