@@ -7,7 +7,7 @@ use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, Decl, Expr, ExprOrSpread, Ident, Program},
+        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, Program},
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
@@ -20,6 +20,7 @@ pub struct TransformVisitor {
     declared: Vec<HashSet<Atom>>,
     deps: Vec<HashSet<Dep>>,
     last_deps: HashSet<Dep>,
+    states: HashSet<ast::Id>,
     member: Option<ast::MemberExpr>,
 }
 
@@ -32,6 +33,7 @@ impl TransformVisitor {
         Self {
             declared: declared,
             deps: deps,
+            states: HashSet::new(),
             last_deps: HashSet::new(),
             member: None,
         }
@@ -74,6 +76,61 @@ impl TransformVisitor {
         return false
     }
 
+    fn add_state(&mut self, name: ast::Id) {
+        self.states.insert(name);
+    }
+
+    fn process_expr(&mut self, expr: &Expr) -> Option<Expr> {
+        match &expr {
+            Expr::Assign(assign) => {
+                match &assign.left {
+                    ast::AssignTarget::Simple(target) => {
+                        match target {
+                            ast::SimpleAssignTarget::Ident(ident) => {
+                                if self.states.contains(&ident.id.to_id()) {
+                                    // foo = foo + 1 => (foo = foo + 1, setFoo(foo), foo)
+                                    Some(Expr::Seq(ast::SeqExpr {
+                                        exprs: vec![
+                                            Box::new(expr.clone()),
+                                            Box::new(Expr::Call(ast::CallExpr {
+                                                callee: ast::Callee::Expr(
+                                                    Box::new(Expr::Ident(
+                                                        Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), DUMMY_SP, SyntaxContext::empty())))),
+                                                args: vec![
+                                                    ast::ExprOrSpread {
+                                                        spread: None,
+                                                        expr: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt)))
+                                                    }],
+                                                type_args: None,
+                                                span: DUMMY_SP,
+                                                ctxt: SyntaxContext::empty(),
+                                            })),
+                                            Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt))),
+                                        ],
+                                        span: expr.span(),
+                                    }))
+                                } else {
+                                    None
+                                }
+                            }
+                            ast::SimpleAssignTarget::Member(member_expr) => todo!(),
+                            ast::SimpleAssignTarget::SuperProp(super_prop_expr) => todo!(),
+                            ast::SimpleAssignTarget::Paren(paren_expr) => todo!(),
+                            ast::SimpleAssignTarget::OptChain(opt_chain_expr) => todo!(),
+                            ast::SimpleAssignTarget::TsAs(ts_as_expr) => todo!(),
+                            ast::SimpleAssignTarget::TsSatisfies(ts_satisfies_expr) => todo!(),
+                            ast::SimpleAssignTarget::TsNonNull(ts_non_null_expr) => todo!(),
+                            ast::SimpleAssignTarget::TsTypeAssertion(ts_type_assertion) => todo!(),
+                            ast::SimpleAssignTarget::TsInstantiation(ts_instantiation) => todo!(),
+                            ast::SimpleAssignTarget::Invalid(invalid) => todo!(),
+                        }
+                    }
+                    ast::AssignTarget::Pat(assign_target_pat) => todo!(),
+                }
+            },
+            _ => None
+        }
+    }
 }
 
 impl VisitMut for TransformVisitor {
@@ -120,11 +177,36 @@ impl VisitMut for TransformVisitor {
         node.visit_mut_children_with(self);
     }
 
+    fn visit_mut_arrow_expr(&mut self, node: &mut ast::ArrowExpr) {
+        self.push_scope();
+        for param in &node.params {
+            for name in util::find_declared(&param) {
+                self.add_to_scope(name.clone());
+            }
+        }
+        if let BlockStmtOrExpr::Expr(expr) = &mut *node.body {
+            if let Some(new_expr) = self.process_expr(&expr) {
+                *node.body = BlockStmtOrExpr::Expr(Box::new(new_expr));
+            }
+        }
+        node.visit_mut_children_with(self);
+        self.pop_scope();
+    }
+
+    fn visit_mut_expr_stmt(&mut self, node: &mut ast::ExprStmt) {
+        if let Some(new_expr) = self.process_expr(&node.expr) {
+            *node.expr = new_expr;
+        }
+        node.visit_mut_children_with(self);
+    }
+
     fn visit_mut_assign_expr(&mut self, node: &mut ast::AssignExpr) {
         match &node.left {
             ast::AssignTarget::Simple(target) => {
                 match target {
-                    ast::SimpleAssignTarget::Ident(ident) => self.add_to_scope(ident.sym.clone()),
+                    ast::SimpleAssignTarget::Ident(ident) => {
+                        self.add_to_scope(ident.sym.clone());
+                    },
                     ast::SimpleAssignTarget::Member(_) => {},
                     _ => {},
                 }
@@ -160,10 +242,49 @@ impl VisitMut for TransformVisitor {
                 self.add_to_scope(f.ident.sym.clone());
             }
             Decl::Var(v) => {
-                for decl in &v.decls {
+                for decl in &mut v.decls {
                     for name in util::find_declared(&decl.name) {
                         self.add_to_scope(name);
                     }
+
+                    if let (ast::Pat::Ident(name_ident), Some(expr)) = (&mut decl.name, &mut decl.init) {
+                        let ident = name_ident.clone();
+
+                        if let Expr::Call(call_expr) = &mut **expr {
+                            if let ast::Callee::Expr(callee) = &mut call_expr.callee {
+                                if let Expr::Ident(callee_ident) = &mut **callee{
+                                    if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
+                                        self.add_state(ident.id.to_id());
+                                        decl.name = ast::Pat::Array(ast::ArrayPat {
+                                            span: ident.span(),
+                                            optional: false,
+                                            type_ann: None,
+                                            elems: vec![
+                                                Some(ast::Pat::Ident(ast::BindingIdent {
+                                                    id: Ident::new(ident.sym.clone().into(), DUMMY_SP, name_ident.ctxt),
+                                                    type_ann: None,
+                                                })),
+                                                Some(ast::Pat::Ident(ast::BindingIdent {
+                                                    id: Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), ident.span, name_ident.ctxt),
+                                                    type_ann: None,
+                                                })),
+                                            ],
+                                        });
+                                        decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
+                                            callee: ast::Callee::Expr(
+                                                Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
+                                            args: vec![call_expr.args[0].clone().into()],
+                                            type_args: None,
+                                            span: expr.span(),
+                                            ..Default::default()
+                                        })));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+
                 }
             }
             _ => {}
@@ -201,32 +322,6 @@ impl VisitMut for TransformVisitor {
         node.visit_mut_children_with(self);
     }
 
-    // fn visit_mut_export_default_decl(&mut self, node: &mut ast::ExportDefaultDecl) {
-    //     if let ast::DefaultDecl::Fn(func) = &mut node.decl {
-    //         if let Some(body) = &mut func.function.body {
-    //         }
-    //     }
-    //     node.visit_mut_children_with(self);
-    // }
-
-    // fn visit_mut_export_decl(&mut self, node: &mut ast::ExportDecl) {
-    //     if let Decl::Fn(func) = &mut node.decl {
-    //         if let Some(body) = &mut func.function.body {
-    //         }
-    //     }
-    //     node.visit_mut_children_with(self);
-    // }
-
-    // fn visit_mut_module_item(&mut self, item: &mut ast::ModuleItem) {
-    //     if let ast::ModuleItem::Stmt(stmt) = item {
-    //         if let ast::Stmt::Decl(Decl::Fn(func)) = stmt {
-    //             if let Some(body) = &mut func.function.body {
-    //             }
-    //         }
-    //     }
-    //     item.visit_mut_children_with(self);
-    // }
-
     fn visit_mut_function(&mut self, node: &mut ast::Function) {
         self.push_scope();
         for param in &node.params {
@@ -234,52 +329,6 @@ impl VisitMut for TransformVisitor {
                 self.add_to_scope(name.clone());
             }
         }
-        node.visit_mut_children_with(self);
-        self.pop_scope();
-    }
-
-    fn visit_mut_arrow_expr(&mut self, node: &mut ast::ArrowExpr) {
-        self.push_scope();
-        for param in &node.params {
-            for name in util::find_declared(&param) {
-                self.add_to_scope(name.clone());
-            }
-        }
-        let mut body = node.body.clone();
-        if let ast::BlockStmtOrExpr::Expr(expr) = &mut *body {
-            let mut expr1 = expr.clone();
-            if let Expr::Assign(assign_expr) = &mut *expr1 {
-                if let ast::AssignTarget::Simple(target) = &mut assign_expr.left {
-                    if let ast::SimpleAssignTarget::Ident(ident) = target {
-                        node.body = Box::new(ast::BlockStmtOrExpr::BlockStmt(ast::BlockStmt {
-                            ctxt: SyntaxContext::empty(),
-                            span: expr.span(),
-                            stmts: vec![
-                                ast::Stmt::Expr(ast::ExprStmt {
-                                    span: expr.span(),
-                                    expr: expr.clone(),
-                                }),
-                                ast::Stmt::Expr(ast::ExprStmt {
-                                    span: expr.span(),
-                                    expr: Box::new(Expr::Call(ast::CallExpr {
-                                                callee: ast::Callee::Expr(
-                                                    Box::new(Expr::Ident(
-                                                        Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), expr.span(), SyntaxContext::empty())))),
-                                                args: vec![
-                                                    ast::ExprOrSpread {
-                                                        spread: None,
-                                                        expr: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), expr.span(), ident.ctxt)))
-                                                    }],
-                                                type_args: None,
-                                                span: expr.span(),
-                                                ..Default::default()
-                                            }))
-                            })],
-                        }));
-                    }
-                };
-            }
-        };
         node.visit_mut_children_with(self);
         self.pop_scope();
     }
@@ -313,50 +362,6 @@ impl VisitMut for TransformVisitor {
         }
     }
 
-    fn visit_mut_block_stmt(&mut self, node: &mut ast::BlockStmt) {
-        node.visit_mut_children_with(self);
-        for inner_stmt in &mut node.stmts {
-            if let ast::Stmt::Decl(Decl::Var(var_decl)) = &mut *inner_stmt {
-                for decl in &mut var_decl.decls {
-                    if let (ast::Pat::Ident(name_ident), Some(expr)) = (&mut decl.name, &mut decl.init) {
-                        let ident = name_ident.clone();
-
-                        if let Expr::Call(call_expr) = &mut **expr {
-                            if let ast::Callee::Expr(callee) = &mut call_expr.callee {
-                                if let Expr::Ident(callee_ident) = &mut **callee{
-                                    if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
-                                        decl.name = ast::Pat::Array(ast::ArrayPat {
-                                            span: ident.span(),
-                                            optional: false,
-                                            type_ann: None,
-                                            elems: vec![
-                                                Some(ast::Pat::Ident(ast::BindingIdent {
-                                                    id: Ident::new(ident.sym.clone().into(), DUMMY_SP, name_ident.ctxt),
-                                                    type_ann: None,
-                                                })),
-                                                Some(ast::Pat::Ident(ast::BindingIdent {
-                                                    id: Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), ident.span, name_ident.ctxt),
-                                                    type_ann: None,
-                                                })),
-                                            ],
-                                        });
-                                        decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
-                                            callee: ast::Callee::Expr(
-                                                Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
-                                            args: vec![call_expr.args[0].clone().into()],
-                                            type_args: None,
-                                            span: expr.span(),
-                                            ..Default::default()
-                                        })));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[plugin_transform]
@@ -428,9 +433,29 @@ test_inline!(
     r#"import { useState } from "react";
 function App() {
     let [count, setCount] = useState(0);
+    let clickHandler = () => (count += 1, setCount(count), count);
+    return null;
+}"#
+);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    assign2,
+    r#"function App() {
+  let count = $state(0);
+  let clickHandler = () => {
+    count+=1;
+    console.log(count);
+  }
+  return null;
+}"#,
+    r#"import { useState } from "react";
+function App() {
+    let [count, setCount] = useState(0);
     let clickHandler = () => {
-        count += 1;
-        setCount(count);
+        count += 1, setCount(count), count;
+        console.log(count);
     }
     return null;
 }"#
@@ -450,9 +475,7 @@ test_inline!(
     r#"import { useState } from "react";
 function App() {
     let [pageTitle, setPageTitle] = useState("");
-    useEffect(() => {
-      pageTitle = document.title;
-    }, [])
+    useEffect(() => {pageTitle = document.title, setPageTitle(pageTitle), pageTitle}, [])
     return null;
 }"#
 );
@@ -465,7 +488,9 @@ test_inline!(
   let data = $state({});
   $effect(() => {
     console.log(props.url)
-    fetch(props.url.toString()).then(x => x.json()).then(val => data = val)
+    fetch(props.url.toString()).then(x => x.json()).then(val => {
+      data = val
+    })
   });
   return null;
 }"#,
@@ -475,8 +500,7 @@ function App(props) {
     useEffect(() => {
       console.log(props.url)
       fetch(props.url.toString()).then(x => x.json()).then(val => {
-        data = val
-        setData(data)
+        data = val, setData(data), data;
       })
     }, [props.url, props.url.toString])
     return null;
