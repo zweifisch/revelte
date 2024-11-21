@@ -7,6 +7,9 @@ import type {} from 'revelte'
 
 function App() {
   let count = $state(0)
+  $effect(() => {
+    console.log(`count: ${count}`)
+  })
   return <div onClick={() => count += 1}>{count}</div>
 }
 ```

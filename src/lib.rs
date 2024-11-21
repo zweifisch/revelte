@@ -14,7 +14,6 @@ use swc_core::{
 use swc_core::plugin::{
     plugin_transform,
     proxies::TransformPluginProgramMetadata};
-use swc_ecma_parser::{EsSyntax, Syntax};
 
 
 pub struct TransformVisitor {
@@ -22,6 +21,7 @@ pub struct TransformVisitor {
     deps: Vec<HashSet<Dep>>,
     last_deps: HashSet<Dep>,
     states: HashSet<ast::Id>,
+    imports: HashSet<String>,
     member: Option<ast::MemberExpr>,
 }
 
@@ -36,6 +36,7 @@ impl TransformVisitor {
             deps: deps,
             states: HashSet::new(),
             last_deps: HashSet::new(),
+            imports: HashSet::new(),
             member: None,
         }
     }
@@ -114,8 +115,8 @@ impl TransformVisitor {
                                     None
                                 }
                             }
-                            ast::SimpleAssignTarget::Member(member_expr) => todo!(),
-                            ast::SimpleAssignTarget::Paren(paren_expr) => todo!(),
+                            // ast::SimpleAssignTarget::Member(member_expr) => todo!(),
+                            // ast::SimpleAssignTarget::Paren(paren_expr) => todo!(),
                             _ => None
                         }
                     }
@@ -303,6 +304,7 @@ impl VisitMut for TransformVisitor {
                                 if let Expr::Ident(callee_ident) = &mut **callee{
                                     if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
                                         self.add_state(ident.id.to_id());
+                                        self.imports.insert("useState".into());
                                         decl.name = ast::Pat::Array(ast::ArrayPat {
                                             span: ident.span(),
                                             optional: false,
@@ -341,33 +343,32 @@ impl VisitMut for TransformVisitor {
     }
 
     fn visit_mut_module(&mut self, node: &mut ast::Module) {
-        Vec::insert(&mut node.body, 0, 
-            ast::ModuleItem::ModuleDecl(ast::ModuleDecl::Import(ast::ImportDecl {
-                span: DUMMY_SP,
-                type_only: false,
-                with: None,
-                phase: ast::ImportPhase::Evaluation,
-                specifiers: vec![
-                    ast::ImportSpecifier::Named(
-                        ast::ImportNamedSpecifier {
-                            span: DUMMY_SP,
-                            is_type_only: false,
-                            local: Ident {
-                                ctxt: SyntaxContext::empty(),
-                                span: DUMMY_SP,
-                                sym: "useState".into(),
-                                optional: false,
-                            },
-                            imported: None,
-                    })],
-                src: Box::new(swc_core::ecma::ast::Str {
-                    raw: None,
-                    value: Atom::new("react"),
-                    span: DUMMY_SP,
-                }),
-            }))
-        );
         node.visit_mut_children_with(self);
+        if self.imports.len() > 0 {
+            let mut imports: Vec<String> = self.imports.clone().into_iter().collect();
+            imports.sort();
+            Vec::insert(&mut node.body, 0, 
+                ast::ModuleItem::ModuleDecl(ast::ModuleDecl::Import(ast::ImportDecl {
+                    span: DUMMY_SP,
+                    type_only: false,
+                    with: None,
+                    phase: ast::ImportPhase::Evaluation,
+                    specifiers: imports.into_iter().map(|x|
+                        ast::ImportSpecifier::Named(
+                            ast::ImportNamedSpecifier {
+                                span: DUMMY_SP,
+                                is_type_only: false,
+                                local: Ident::new(x.to_string().into(), DUMMY_SP, SyntaxContext::empty()),
+                                imported: None,
+                            }),
+                    ).collect(),
+                    src: Box::new(swc_core::ecma::ast::Str {
+                        raw: None,
+                        value: Atom::new("react"),
+                        span: DUMMY_SP,
+                    }),
+                })))
+        }
     }
 
     fn visit_mut_function(&mut self, node: &mut ast::Function) {
@@ -387,14 +388,18 @@ impl VisitMut for TransformVisitor {
             if let Expr::Ident(callee_ident) = &mut **callee{
                 if callee_ident.sym == "$effect" && node.args.len() == 1 {
                     callee_ident.sym = "useEffect".into();
+                    callee_ident.ctxt = SyntaxContext::empty();
+                    self.imports.insert("useEffect".into());
                     // println!("deps {:?}", &self.last_deps);
+                    let mut deps: Vec<Dep> = self.last_deps.clone().into_iter().collect();
+                    deps.sort();
                     node.args = vec![
                         node.args[0].clone().into(),
                         ExprOrSpread {
                             spread: None,
                             expr: Box::new(Expr::Array(ast::ArrayLit {
                                 span: DUMMY_SP,
-                                elems: self.last_deps.clone().into_iter().map(|x| Some(ExprOrSpread {
+                                elems: deps.into_iter().map(|x| Some(ExprOrSpread {
                                     spread: None,
                                     expr: Box::new(
                                         match x {
@@ -527,7 +532,7 @@ function App() {
 );
 
 test_inline!(
-    Syntax::Es(EsSyntax {
+    swc_ecma_parser::Syntax::Es(swc_ecma_parser::EsSyntax {
         jsx: true,
         ..Default::default()
     }),
@@ -555,7 +560,7 @@ test_inline!(
   });
   return null;
 }"#,
-    r#"import { useState } from "react";
+    r#"import { useEffect, useState } from "react";
 function App() {
     let [pageTitle, setPageTitle] = useState("");
     useEffect(() => {pageTitle = document.title, setPageTitle(pageTitle), pageTitle}, [])
@@ -577,7 +582,7 @@ test_inline!(
   });
   return null;
 }"#,
-    r#"import { useState } from "react";
+    r#"import { useEffect, useState } from "react";
 function App(props) {
     let [data, setData] = useState({});
     useEffect(() => {
