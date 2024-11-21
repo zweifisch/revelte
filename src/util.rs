@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use swc_core::{
     atoms::Atom,
-    ecma::ast::{self}};
+    ecma::ast::{self, Expr, Ident, MemberExpr}};
 
 pub fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
@@ -54,6 +54,14 @@ pub fn find_declared(pat: &ast::Pat) -> HashSet<Atom> {
         ast::Pat::Invalid(_) => {}
     }
     deps
+}
+
+pub fn member_root(expr: &MemberExpr) -> Option<Ident> {
+    match &*expr.obj {
+        Expr::Ident(ident) => Some(ident.clone()),
+        Expr::Member(member) => member_root(&member),
+        _ => None
+    }
 }
 
 pub fn member_expr_to_string(expr: &ast::MemberExpr) -> String {

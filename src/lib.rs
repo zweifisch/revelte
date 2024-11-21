@@ -1,5 +1,6 @@
 mod util;
 mod dep;
+mod immer;
 
 use std::collections::HashSet;
 use dep::Dep;
@@ -14,6 +15,7 @@ use swc_core::{
 use swc_core::plugin::{
     plugin_transform,
     proxies::TransformPluginProgramMetadata};
+use util::member_root;
 
 
 pub struct TransformVisitor {
@@ -115,8 +117,14 @@ impl TransformVisitor {
                                     None
                                 }
                             }
-                            // ast::SimpleAssignTarget::Member(member_expr) => todo!(),
-                            // ast::SimpleAssignTarget::Paren(paren_expr) => todo!(),
+                            ast::SimpleAssignTarget::Member(member_expr) => {
+                                if let Some(ident) = member_root(member_expr) {
+                                    if self.states.contains(&ident.to_id()) {
+                                        return immer::immutize_member_assignment(member_expr, &assign.right)
+                                    }
+                                }
+                                None
+                            },
                             _ => None
                         }
                     }
@@ -592,5 +600,50 @@ function App(props) {
       })
     }, [props.url, props.url.toString])
     return null;
-}"#
-);
+}"#);
+
+test_inline!(
+    swc_ecma_parser::Syntax::Es(swc_ecma_parser::EsSyntax {
+        jsx: true,
+        ..Default::default()
+    }),
+    |_| as_folder(TransformVisitor::new()),
+    example, 
+    r#"function App() {
+  let count = $state(0)
+  $effect(() => {
+    console.log(`count: ${count}`)
+  })
+  return <div onClick={() => count += 1}>{count}</div>
+}"#,
+    r#"import { useEffect, useState } from "react";
+function App() {
+  let [count, setCount] = useState(0)
+  useEffect(() => {
+    console.log(`count: ${count}`)
+  }, [count])
+  return <div onClick={() => (count += 1, setCount(count), count)}>{count}</div>
+}"#);
+
+test_inline!(
+    swc_ecma_parser::Syntax::Es(swc_ecma_parser::EsSyntax {
+        jsx: true,
+        ..Default::default()
+    }),
+    |_| as_folder(TransformVisitor::new()),
+    example_object, 
+    r#"function App() {
+  let state = $state({count:0})
+  $effect(() => {
+    console.log(`count: ${state.count}`)
+  })
+  return <div onClick={() => state.count = state.count + 1}>{state.count}</div>
+}"#,
+    r#"import { useEffect, useState } from "react";
+function App() {
+  let [state, setState] = useState({count:0})
+  useEffect(() => {
+    console.log(`count: ${state.count}`)
+  }, [state.count])
+  return <div onClick={() => (state = {... state, count: state.count + 1}, setState(state), state)}>{state.count}</div>
+}"#);
