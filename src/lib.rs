@@ -13,25 +13,12 @@ use swc_core::{
 use swc_core::plugin::{
     plugin_transform,
     proxies::TransformPluginProgramMetadata};
-use util::find_declared;
 
 
 #[derive(Debug, Clone, Eq)]
 enum Dep {
     Ident(ast::Ident),
     MemberExpr(ast::MemberExpr),
-}
-
-fn find_root(expr: &MemberExpr) -> Option<ast::Ident> {
-    if let Expr::Member(obj) = &*expr.obj {
-        find_root(&obj)
-    } else {
-        if let Expr::Ident(ident) = &*expr.obj {
-            Some(ident.clone())
-        } else {
-            None
-        }
-    }
 }
 
 fn to_string(expr: &MemberExpr) -> String {
@@ -126,10 +113,6 @@ impl TransformVisitor {
         self.deps.push(last);
     }
 
-    fn current_deps(&mut self) -> &HashSet<Dep> {
-        self.deps.last().unwrap()
-    }
-
     fn current_scope(&mut self) -> &HashSet<Atom> {
         self.declared.last().unwrap()
     }
@@ -195,7 +178,7 @@ impl VisitMut for TransformVisitor {
             ast::AssignTarget::Simple(target) => {
                 match target {
                     ast::SimpleAssignTarget::Ident(ident) => self.add_to_scope(ident.sym.clone()),
-                    ast::SimpleAssignTarget::Member(member_expr) => todo!(),
+                    ast::SimpleAssignTarget::Member(_) => {},
                     _ => {},
                 }
             }

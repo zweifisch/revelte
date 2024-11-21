@@ -1,11 +1,12 @@
 {
     "name": "revelte",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "",
     "author": "",
     "license": "ISC",
     "keywords": ["swc-plugin"],
     "main": "target/wasm32-wasi/release/revelte.wasm",
+    "types": "type.d.ts",
     "scripts": {
         "prepublishOnly": "cargo build-wasi --release"
     },

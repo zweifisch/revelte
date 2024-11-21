@@ -3,6 +3,8 @@
 `$state()` and `$effect()` for react, WIP
 
 ```jsx
+import type {} from 'revelte'
+
 function App() {
   let count = $state(0)
   const inc = () => count += 1
@@ -10,7 +12,7 @@ function App() {
 }
 ```
 
-## Install
+## Setup
 
 ```sh
 npm create vite@latest my-react-app -- --template react-swc-ts
@@ -22,7 +24,7 @@ in `vite.config.ts` add `revelte` as a plugin:
 
 ```js
 export default defineConfig({
-  plugins: [react({plugins: [['revelte']]})],
+  plugins: [react({plugins: [['revelte', {}]]})],
 })
 ```
 
