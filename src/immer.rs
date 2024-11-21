@@ -6,44 +6,51 @@ use crate::util::{self, member_root};
 fn immutize_member_op(expr: &MemberExpr, value: Expr) -> Option<Expr> {
   match &*expr.obj {
     Expr::Member(member_expr) => {
-      match &expr.prop {
-        MemberProp::Ident(ident) => {
-          immutize_member_op(member_expr, Expr::Object(ObjectLit {
-            props: vec![
-              PropOrSpread::Spread(SpreadElement {
-                dot3_token: DUMMY_SP,
-                expr: Box::new(Expr::Member(member_expr.clone()))
-              }),
-              PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
-                key: PropName::Ident(ident.clone()),
-                value: Box::new(value),
-              }))),
-            ],
-            span: DUMMY_SP,
-          }))
-        }
-        MemberProp::Computed(computed_prop_name) => todo!(),
-        MemberProp::PrivateName(_) => None
+      if let MemberProp::PrivateName(_) = &expr.prop {
+        None
+      } else {
+        immutize_member_op(member_expr, Expr::Object(ObjectLit {
+          props: vec![
+            PropOrSpread::Spread(SpreadElement {
+              dot3_token: DUMMY_SP,
+              expr: Box::new(Expr::Member(member_expr.clone()))
+            }),
+            PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
+              key: match &expr.prop {
+                MemberProp::Ident(ident) => PropName::Ident(ident.clone()),
+                MemberProp::Computed(name) => PropName::Computed(name.clone()),
+                _ => todo!(),
+              },
+              value: Box::new(value),
+            }))),
+          ],
+          span: DUMMY_SP,
+        }))
       }
     }
     Expr::Ident(root) => {
       match &expr.prop {
-        MemberProp::Ident(ident) => {
+        MemberProp::Ident(_) | MemberProp::Computed(_) => {
           Some(Expr::Object(ObjectLit {
             props: vec![
-              PropOrSpread::Spread(SpreadElement { dot3_token: DUMMY_SP, expr: Box::new(Expr::Ident(root.clone()))}),
+              PropOrSpread::Spread(SpreadElement {
+                dot3_token: DUMMY_SP,
+                expr: Box::new(Expr::Ident(root.clone()))
+              }),
               PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
-                key: PropName::Ident(ident.clone()),
+                key: match &expr.prop {
+                  MemberProp::Ident(ident) => PropName::Ident(ident.clone()),
+                  MemberProp::Computed(name) => PropName::Computed(name.clone()),
+                  _ => todo!(),
+                },
                 value: Box::new(value),
               }))),
             ],
             span: DUMMY_SP,
           }))
         }
-        MemberProp::Computed(computed_prop_name) => todo!(),
         MemberProp::PrivateName(_) => None
       }
-
     }
     _ => None
   }
@@ -117,6 +124,19 @@ mod tests {
         ).unwrap()),
       swc_ecma_codegen::to_code(
         &*parse_expr("a = {...a, b: {... a.b, c: null}}, setA(a), a"),
+      ))
+  }
+
+  #[test]
+  fn immutize_member_computed() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_member_assignment(
+          &*parse_expr("a[b].c['key']").as_member().unwrap(),
+          &Expr::Lit(Lit::Null(Null {span: DUMMY_SP}))
+        ).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("a = {...a, [b]: {... a[b], c: {... a[b].c, ['key']: null}}}, setA(a), a"),
       ))
   }
 }

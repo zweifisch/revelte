@@ -1,6 +1,6 @@
 # revelte
 
-`$state()` and `$effect()` for react, WIP
+`$state()` and `$effect()` for react
 
 ```jsx
 import type {} from 'revelte'
@@ -32,4 +32,18 @@ export default defineConfig({
 
 ```sh
 npm run dev
+```
+
+## When will state be updated
+
+- reassigning $state variables, like `count = newVal`
+- updating $state variables, like `foo.bar = newVal`
+
+```jsx
+import type {} from 'revelte'
+
+function App() {
+  let count = $state({value: 0})
+  return <div onClick={() => count.value += 1}>{count.value}</div>
+}
 ```
