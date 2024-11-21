@@ -7,8 +7,7 @@ import type {} from 'revelte'
 
 function App() {
   let count = $state(0)
-  const inc = () => count += 1
-  return <div onClick={inc}>{count}</div>
+  return <div onClick={() => count += 1}>{count}</div>
 }
 ```
 

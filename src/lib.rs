@@ -7,13 +7,14 @@ use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, Program},
+        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, Program, op},
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
 use swc_core::plugin::{
     plugin_transform,
     proxies::TransformPluginProgramMetadata};
+use swc_ecma_parser::{EsSyntax, Syntax};
 
 
 pub struct TransformVisitor {
@@ -88,7 +89,7 @@ impl TransformVisitor {
                         match target {
                             ast::SimpleAssignTarget::Ident(ident) => {
                                 if self.states.contains(&ident.id.to_id()) {
-                                    // foo = foo + 1 => (foo = foo + 1, setFoo(foo), foo)
+                                    // foo = foo + 1  =>  (foo = foo + 1, setFoo(foo), foo)
                                     Some(Expr::Seq(ast::SeqExpr {
                                         exprs: vec![
                                             Box::new(expr.clone()),
@@ -114,20 +115,67 @@ impl TransformVisitor {
                                 }
                             }
                             ast::SimpleAssignTarget::Member(member_expr) => todo!(),
-                            ast::SimpleAssignTarget::SuperProp(super_prop_expr) => todo!(),
                             ast::SimpleAssignTarget::Paren(paren_expr) => todo!(),
-                            ast::SimpleAssignTarget::OptChain(opt_chain_expr) => todo!(),
-                            ast::SimpleAssignTarget::TsAs(ts_as_expr) => todo!(),
-                            ast::SimpleAssignTarget::TsSatisfies(ts_satisfies_expr) => todo!(),
-                            ast::SimpleAssignTarget::TsNonNull(ts_non_null_expr) => todo!(),
-                            ast::SimpleAssignTarget::TsTypeAssertion(ts_type_assertion) => todo!(),
-                            ast::SimpleAssignTarget::TsInstantiation(ts_instantiation) => todo!(),
-                            ast::SimpleAssignTarget::Invalid(invalid) => todo!(),
+                            _ => None
                         }
                     }
                     ast::AssignTarget::Pat(assign_target_pat) => todo!(),
                 }
             },
+            Expr::Update(update) => {
+                match &*update.arg {
+                    Expr::Ident(ident) => {
+                        if self.states.contains(&ident.to_id()) {
+                            // ++foo  =>  foo, setFoo(foo), foo
+                            // foo++  =>  foo++, setFoo(foo), foo - 1
+                            Some(Expr::Seq(ast::SeqExpr {
+                                exprs: vec![
+                                    Box::new(expr.clone()),
+                                    Box::new(Expr::Call(ast::CallExpr {
+                                        callee: ast::Callee::Expr(
+                                            Box::new(Expr::Ident(
+                                                Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), DUMMY_SP, SyntaxContext::empty())))),
+                                        args: vec![
+                                            ast::ExprOrSpread {
+                                                spread: None,
+                                                expr: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt)))
+                                            }],
+                                        type_args: None,
+                                        span: DUMMY_SP,
+                                        ctxt: SyntaxContext::empty(),
+                                    })),
+                                    if update.prefix {
+                                        Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt)))
+                                    } else {
+                                        match update.op {
+                                            ast::UpdateOp::PlusPlus => {
+                                                Box::new(Expr::Bin(ast::BinExpr {
+                                                    span: DUMMY_SP,
+                                                    op: op!(bin, "-"),
+                                                    left: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt))),
+                                                    right: 1.into()
+                                                }))
+                                            }
+                                            ast::UpdateOp::MinusMinus => {
+                                                Box::new(Expr::Bin(ast::BinExpr {
+                                                    span: DUMMY_SP,
+                                                    op: op!(bin, "+"),
+                                                    left: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt))),
+                                                    right: 1.into()
+                                                }))
+                                            }
+                                        }
+                                    }
+                                ],
+                                span: expr.span(),
+                            }))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None
+                }
+            }
             _ => None
         }
     }
@@ -458,6 +506,41 @@ function App() {
         console.log(count);
     }
     return null;
+}"#
+);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    update,
+    r#"function App() {
+  let count = $state(0);
+  let clickHandler = () => count ++
+  return null;
+}"#,
+    r#"import { useState } from "react";
+function App() {
+    let [count, setCount] = useState(0);
+    let clickHandler = () => (count ++, setCount(count), count - 1);
+    return null;
+}"#
+);
+
+test_inline!(
+    Syntax::Es(EsSyntax {
+        jsx: true,
+        ..Default::default()
+    }),
+    |_| as_folder(TransformVisitor::new()),
+    jsx,
+    r#"function App() {
+  let count = $state(0);
+  return <div onClick={() => ++count}>{count}</div>
+}"#,
+    r#"import { useState } from "react";
+function App() {
+    let [count, setCount] = useState(0);
+    return <div onClick={() => (++count, setCount(count), count)}>{count}</div>
 }"#
 );
 
