@@ -4,11 +4,12 @@ mod immer;
 
 use std::collections::HashSet;
 use dep::Dep;
+use immer::immutize_update;
 use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, Program, op},
+        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, Program },
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
@@ -128,59 +129,25 @@ impl TransformVisitor {
                             _ => None
                         }
                     }
-                    ast::AssignTarget::Pat(assign_target_pat) => todo!(),
+                    ast::AssignTarget::Pat(_) => None,
                 }
             },
             Expr::Update(update) => {
                 match &*update.arg {
                     Expr::Ident(ident) => {
                         if self.states.contains(&ident.to_id()) {
-                            // ++foo  =>  foo, setFoo(foo), foo
-                            // foo++  =>  foo++, setFoo(foo), foo - 1
-                            Some(Expr::Seq(ast::SeqExpr {
-                                exprs: vec![
-                                    Box::new(expr.clone()),
-                                    Box::new(Expr::Call(ast::CallExpr {
-                                        callee: ast::Callee::Expr(
-                                            Box::new(Expr::Ident(
-                                                Ident::new(format!("set{}", util::capitalize_first(&ident.sym)).into(), DUMMY_SP, SyntaxContext::empty())))),
-                                        args: vec![
-                                            ast::ExprOrSpread {
-                                                spread: None,
-                                                expr: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt)))
-                                            }],
-                                        type_args: None,
-                                        span: DUMMY_SP,
-                                        ctxt: SyntaxContext::empty(),
-                                    })),
-                                    if update.prefix {
-                                        Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt)))
-                                    } else {
-                                        match update.op {
-                                            ast::UpdateOp::PlusPlus => {
-                                                Box::new(Expr::Bin(ast::BinExpr {
-                                                    span: DUMMY_SP,
-                                                    op: op!(bin, "-"),
-                                                    left: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt))),
-                                                    right: 1.into()
-                                                }))
-                                            }
-                                            ast::UpdateOp::MinusMinus => {
-                                                Box::new(Expr::Bin(ast::BinExpr {
-                                                    span: DUMMY_SP,
-                                                    op: op!(bin, "+"),
-                                                    left: Box::new(Expr::Ident(Ident::new(ident.sym.clone(), DUMMY_SP, ident.ctxt))),
-                                                    right: 1.into()
-                                                }))
-                                            }
-                                        }
-                                    }
-                                ],
-                                span: expr.span(),
-                            }))
+                            immutize_update(&expr, &ident, &update.op, update.prefix)
                         } else {
                             None
                         }
+                    }
+                    Expr::Member(member_expr) => {
+                        if let Some(ident) = member_root(member_expr) {
+                            if self.states.contains(&ident.to_id()) {
+                                return immer::immutize_member_update(member_expr, &update.op, update.prefix)
+                            }
+                        }
+                        None
                     }
                     _ => None
                 }
@@ -540,6 +507,23 @@ function App() {
 );
 
 test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    member_update,
+    r#"function App() {
+  let count = $state({value: 0});
+  let clickHandler = () => count.value ++
+  return null;
+}"#,
+    r#"import { useState } from "react";
+function App() {
+    let [count, setCount] = useState({value: 0});
+    let clickHandler = () => (count = {... count, value: count.value + 1}, setCount(count), count.value - 1);
+    return null;
+}"#
+);
+
+test_inline!(
     swc_ecma_parser::Syntax::Es(swc_ecma_parser::EsSyntax {
         jsx: true,
         ..Default::default()
@@ -645,5 +629,5 @@ function App() {
   useEffect(() => {
     console.log(`count: ${state.count}`)
   }, [state.count])
-  return <div onClick={() => (state = {... state, count: state.count + 1}, setState(state), state)}>{state.count}</div>
+  return <div onClick={() => (state = {... state, count: state.count + 1}, setState(state), state.count)}>{state.count}</div>
 }"#);
