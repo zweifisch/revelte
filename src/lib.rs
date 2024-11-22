@@ -4,12 +4,11 @@ mod immer;
 
 use std::collections::HashSet;
 use dep::Dep;
-use immer::immutize_update;
 use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, Program },
+        ast::{self, BlockStmtOrExpr, Callee, Decl, Expr, ExprOrSpread, Ident, Program },
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
@@ -131,12 +130,12 @@ impl TransformVisitor {
                     }
                     ast::AssignTarget::Pat(_) => None,
                 }
-            },
+            }
             Expr::Update(update) => {
                 match &*update.arg {
                     Expr::Ident(ident) => {
                         if self.states.contains(&ident.to_id()) {
-                            immutize_update(&expr, &ident, &update.op, update.prefix)
+                            immer::immutize_update(&expr, &ident, &update.op, update.prefix)
                         } else {
                             None
                         }
@@ -150,6 +149,23 @@ impl TransformVisitor {
                         None
                     }
                     _ => None
+                }
+            }
+            Expr::Call(call) => {
+                if let ast::Callee::Expr(call_expr) = &call.callee {
+                    match &**call_expr {
+                        Expr::Member(_) => {
+                            if let Some((root, _)) = util::member_call(&call) {
+                                if self.states.contains(&root.to_id()) {
+                                    return immer::immutize_array_op(&call)
+                                }
+                            }
+                            None
+                        }
+                        _ => None
+                    }
+                } else {
+                    None
                 }
             }
             _ => None
@@ -360,32 +376,35 @@ impl VisitMut for TransformVisitor {
     fn visit_mut_call_expr(&mut self, node: &mut ast::CallExpr) {
         node.visit_mut_children_with(self);
         if let ast::Callee::Expr(callee) = &mut node.callee {
-            if let Expr::Ident(callee_ident) = &mut **callee{
-                if callee_ident.sym == "$effect" && node.args.len() == 1 {
-                    callee_ident.sym = "useEffect".into();
-                    callee_ident.ctxt = SyntaxContext::empty();
-                    self.imports.insert("useEffect".into());
-                    // println!("deps {:?}", &self.last_deps);
-                    let mut deps: Vec<Dep> = self.last_deps.clone().into_iter().collect();
-                    deps.sort();
-                    node.args = vec![
-                        node.args[0].clone().into(),
-                        ExprOrSpread {
-                            spread: None,
-                            expr: Box::new(Expr::Array(ast::ArrayLit {
-                                span: DUMMY_SP,
-                                elems: deps.into_iter().map(|x| Some(ExprOrSpread {
-                                    spread: None,
-                                    expr: Box::new(
-                                        match x {
-                                            Dep::Ident(x) => Expr::Ident(x),
-                                            Dep::MemberExpr(x) => Expr::Member(x),
-                                        })
-                                })).collect(),
-                            }))
-                        }
-                    ];
+            match &mut ** callee {
+                Expr::Ident(callee_ident) => {
+                    if callee_ident.sym == "$effect" && node.args.len() == 1 {
+                        callee_ident.sym = "useEffect".into();
+                        callee_ident.ctxt = SyntaxContext::empty();
+                        self.imports.insert("useEffect".into());
+                        // println!("deps {:?}", &self.last_deps);
+                        let mut deps: Vec<Dep> = self.last_deps.clone().into_iter().collect();
+                        deps.sort();
+                        node.args = vec![
+                            node.args[0].clone().into(),
+                            ExprOrSpread {
+                                spread: None,
+                                expr: Box::new(Expr::Array(ast::ArrayLit {
+                                    span: DUMMY_SP,
+                                    elems: deps.into_iter().map(|x| Some(ExprOrSpread {
+                                        spread: None,
+                                        expr: Box::new(
+                                            match x {
+                                                Dep::Ident(x) => Expr::Ident(x),
+                                                Dep::MemberExpr(x) => Expr::Member(x),
+                                            })
+                                    })).collect(),
+                                }))
+                            }
+                        ];
+                    }
                 }
+                _ => {}
             }
         }
     }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use swc_core::{
     atoms::Atom,
-    ecma::ast::{self, Expr, Ident, MemberExpr}};
+    ecma::ast::{self, CallExpr, Callee, Expr, Ident, MemberExpr, MemberProp}};
 
 pub fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
@@ -92,6 +92,19 @@ pub fn member_expr_to_string(expr: &ast::MemberExpr) -> String {
         _ => "".into(),
     };
     format!("{}{}", prefix, prop)
+}
+
+pub fn member_call(expr: &CallExpr) -> Option<(Ident, String)> {
+    if let Callee::Expr(expr) = &expr.callee {
+        if let Expr::Member(member_expr) = &**expr {
+            if let Some(root) = member_root(member_expr) {
+                if let MemberProp::Ident(ident) = &member_expr.prop {
+                    return Some((root, ident.sym.to_string()));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
