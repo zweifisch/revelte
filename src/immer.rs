@@ -1,7 +1,7 @@
 
 use std::vec;
 
-use swc_core::{atoms::Atom, common::{Spanned, SyntaxContext, DUMMY_SP}, ecma::ast::{op, ArrayLit, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Callee, ComputedPropName, CondExpr, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function, Ident, IdentName, KeyValueProp, MemberExpr, MemberProp, ObjectLit, ObjectPatProp, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, SeqExpr, SimpleAssignTarget, SpreadElement, Stmt, UnaryExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclarator}};
+use swc_core::{atoms::Atom, ecma::ast::{op, ArrayLit, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Callee, ComputedPropName, CondExpr, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function, Ident, IdentName, KeyValueProp, MemberExpr, MemberProp, ObjectLit, ObjectPatProp, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, SeqExpr, SimpleAssignTarget, SpreadElement, Stmt, UnaryExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclarator}, common::{SyntaxContext, DUMMY_SP}};
 
 use crate::util::{self, find_declared, member_root};
 
@@ -82,23 +82,14 @@ fn set_ident(ident: &Ident) -> Expr {
   - {... a, b: {... a.b, c: x}}
 */
 pub fn immutize_member_assignment(expr: &MemberExpr, value: &Expr) -> Option<Expr> {
-  if let Some(tranformed) = immutize_member_op(&expr, value.clone()) {
+  immutize_member_op(&expr, value.clone()).map(|transformed| {
     let ident= member_root(expr).unwrap();
-    return Some(Expr::Seq(SeqExpr {
-        exprs: vec![
-            Box::new(Expr::Assign(AssignExpr {
-              left: ident.clone().into(),
-              right: Box::new(tranformed),
-              span: DUMMY_SP,
-              op: AssignOp::Assign,
-            })),
-            Box::new(set_ident(&ident)),
-            Box::new(Expr::Member(expr.clone())),
-        ],
-        span: DUMMY_SP,
-    }))
-  }
-  None
+    return seq(vec![
+      assign(ident.clone().into(), transformed),
+      set_ident(&ident),
+      expr.clone().into(),
+    ])
+  })
 }
 
 pub fn list_destruct_vars(pat: &AssignTargetPat) -> Vec<String> {
@@ -425,10 +416,39 @@ fn immutize_pop(expr: &CallExpr) -> Option<Expr> {
 }
 
 /*
-  obj.unshift(expr)  =>  Array.isArray(obj) ? obj = [expr, ... obj], obj.length : obj.unshift(expr)
+  obj.unshift(expr1, expr2)  =>  Array.isArray(obj) ? (obj = [expr1, expr2, ... obj], setObj(obj), obj.length) : obj.unshift(expr1, expr2)
 */
 fn immutize_unshift(expr: &CallExpr) -> Option<Expr> {
-  todo!()
+  let member_expr = expr.callee.as_expr().unwrap().as_member().unwrap();
+  match &*member_expr.obj {
+    Expr::Ident(obj) => {
+      let mut elems = expr.args.clone();
+      elems.push(spread_elem(obj.clone().into()));
+      Some(is_array_guard(
+        &obj.clone().into(),
+        &paren(seq(vec![
+          assign(obj.clone().into(), array(elems)),
+          set_ident(&obj),
+          member(obj.clone().into(), "length".into())
+        ])),
+        &expr.clone().into()))
+    }
+    Expr::Member(obj) => {
+      let root = member_root(obj).unwrap();
+      let mut elems = expr.args.clone();
+      elems.push(spread_elem(obj.clone().into()));
+      Some(is_array_guard(
+        &obj.clone().into(),
+        &paren(seq(vec![
+          assign(root.clone().into(),
+            immutize_member_op(&obj.clone(), array(elems)).unwrap()),
+          set_ident(&root),
+          member(obj.clone().into(), "length".into())
+        ])),
+        &expr.clone().into()))
+    }
+    _ => None
+  }
 }
 
 /*
@@ -554,6 +574,7 @@ pub fn immutize_array_op(expr: &CallExpr) -> Option<Expr> {
       "push" => immutize_push(expr),
       "pop" => immutize_pop(expr),
       "shift" => immutize_shift(expr),
+      "unshift" => immutize_unshift(expr),
       "reverse" | "sort" | "fill" | "copyWithin" => immutize_array_op_by_clone(expr),
       _ => None
     })
@@ -652,6 +673,26 @@ mod tests {
         &immutize_shift(&*parse_expr("a.b.shift()").as_call().unwrap()).unwrap()),
       swc_ecma_codegen::to_code(
         &*parse_expr("Array.isArray(a.b) ? (function() {let tmp = a.b[0]; return a = {...a, b: a.b.slice(1)}, setA(a), tmp})() : a.b.shift()"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_unshift() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_unshift(&*parse_expr("a.unshift(1, 2)").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a) ? (a = [1, 2, ...a], setA(a), a.length) : a.unshift(1, 2)"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_unshift_member() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_unshift(&*parse_expr("a.b.unshift(1, 2)").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a.b) ? (a = {...a, b: [1, 2, ...a.b]}, setA(a), a.b.length) : a.b.unshift(1, 2)"),
       ))
   }
 
