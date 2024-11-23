@@ -278,20 +278,12 @@ fn immutize_push(expr: &CallExpr) -> Option<Expr> {
       elems.extend(expr.args.clone().into_iter().map(|x| Some(x.clone())));
       Some(is_array_guard(
         &Expr::Ident(ident.clone()),
-        &Expr::Paren(ParenExpr {
-          span: DUMMY_SP,
-          expr: Box::new(Expr::Seq(SeqExpr {
+        &paren(Expr::Seq(SeqExpr {
           span: expr.span(),
           exprs: vec![
-            Box::new(Expr::Assign(AssignExpr {
-                left: AssignTarget::Simple(SimpleAssignTarget::Ident(BindingIdent { id: ident.clone(), type_ann: None })),
-                op: AssignOp::Assign,
-                right: Box::new(Expr::Array(ArrayLit{ span:DUMMY_SP, elems:elems })),
-                span: DUMMY_SP,
-            })),
+            Box::new(assign(ident.clone().into(), Expr::Array(ArrayLit{ span:DUMMY_SP, elems:elems }))),
             Box::new(set_ident(&ident)),
-          ]}))
-        }),
+          ]})),
         &Expr::Call(expr.clone())))
     }
     Expr::Member(member_expr) => {
@@ -301,9 +293,9 @@ fn immutize_push(expr: &CallExpr) -> Option<Expr> {
   }
 }
 
-fn assign(left: Ident, right: Expr) -> Expr {
+fn assign(left: SimpleAssignTarget, right: Expr) -> Expr {
   Expr::Assign(AssignExpr {
-    left: AssignTarget::Simple(SimpleAssignTarget::Ident(BindingIdent { id: left, type_ann: None })),
+    left: AssignTarget::Simple(left),
     op: AssignOp::Assign,
     right: Box::new(right),
     span: DUMMY_SP,
@@ -350,6 +342,16 @@ fn call(callee: Expr, args: Vec<Expr>) -> Expr {
       spread: None,
       expr: Box::new(x),
     }).collect(),
+    type_args: None,
+  })
+}
+
+fn call_with_args(callee: Expr, args: Vec<ExprOrSpread>) -> Expr {
+  Expr::Call(CallExpr {
+    span: DUMMY_SP,
+    ctxt: SyntaxContext::empty(),
+    callee: Callee::Expr(Box::new(callee)),
+    args: args,
     type_args: None,
   })
 }
@@ -423,7 +425,7 @@ fn immutize_pop(expr: &CallExpr) -> Option<Expr> {
             span: expr.span(),
             exprs: vec![
               Box::new(assign(
-                ident.clone(),
+                ident.clone().into(),
                 call(member(Expr::Ident(ident.clone()), "slice".into()), vec![0.into(), Expr::Unary(UnaryExpr { span: DUMMY_SP, op: op!(unary, "-"), arg: 1.into() })]))),
               Box::new(set_ident(&ident)),
               Box::new(Expr::Ident(poped.clone())),
@@ -465,25 +467,60 @@ fn immutize_splice(expr: &CallExpr) -> Option<Expr> {
   todo!()
 }
 
-/*
-  obj.reverse() =>  Array.isArray(obj) ? [...obj].reverse() : obj.reverse()
-*/
-fn immutize_reverse(expr: &CallExpr) -> Option<Expr> {
-  todo!()
+fn seq(exprs: Vec<Expr>) -> Expr {
+  Expr::Seq(SeqExpr {
+    span: DUMMY_SP,
+    exprs: exprs.into_iter().map(|x|Box::new(x)).collect(),
+  })
+}
+
+fn array(elems: Vec<ExprOrSpread>) -> Expr {
+  Expr::Array(ArrayLit{ span:DUMMY_SP, elems: elems.into_iter().map(|x| Some(x)).collect() })
+}
+
+fn spread_elem(expr: Expr) -> ExprOrSpread {
+  ExprOrSpread {
+    spread: Some(DUMMY_SP),
+    expr: Box::new(expr),
+  }
 }
 
 /*
-  obj.sort() =>  Array.isArray(obj) ? [...obj].sort() : obj.reverse()
+  obj.reverse() =>  Array.isArray(obj) ? (obj = [...obj].reverse(), setObj(obj), obj) : obj.reverse()
+  obj.prop.sort() =>  Array.isArray(obj.prop) ? (obj = {...obj, prop: [...obj.prop].sort()}, setObj(obj), obj.prop) : obj.prop.sort()
+  obj.fill(value, start, end) =>  Array.isArray(obj) ? (obj = [...obj].fill(value, start, end), setObj(obj), obj) : obj.fill(value, start, end)
 */
-fn immutize_sort(expr: &CallExpr) -> Option<Expr> {
-  todo!()
-}
 
-/*
-  obj.fill(value, start, end) =>  Array.isArray(obj) ? [...obj].fill(value, start, end) : obj.fill(value, start, end)
-*/
-fn immutize_fill(expr: &CallExpr) -> Option<Expr> {
-  todo!()
+fn immutize_array_op_by_clone(expr: &CallExpr) -> Option<Expr> {
+  let member_expr = expr.callee.as_expr().unwrap().as_member().unwrap();
+  let method = member_expr.prop.as_ident().unwrap();
+  match &*member_expr.obj {
+    Expr::Ident(ident) => {
+      Some(is_array_guard(
+        &member_expr.obj,
+        &paren(seq(vec![
+          assign(ident.clone().into(), call_with_args(
+            member(array(vec![spread_elem(ident.clone().into())]), method.sym.clone().into()),
+            expr.args.clone())),
+          set_ident(&ident),
+          *member_expr.obj.clone(),
+        ])),
+        &expr.clone().into()))
+    }
+    Expr::Member(obj) => {
+      Some(is_array_guard(
+        &member_expr.obj,
+        &paren(seq(vec![
+          assign(member_root(obj).unwrap().into(), immutize_member_op(&obj.clone(), call_with_args(
+            member(array(vec![spread_elem(obj.clone().into())]), method.sym.clone().into()),
+            expr.args.clone())).unwrap()),
+          set_ident(&member_root(obj).unwrap()),
+          *member_expr.obj.clone(),
+        ])),
+        &expr.clone().into()))
+    }
+    _ => None
+  }
 }
 
 pub fn immutize_array_op(expr: &CallExpr) -> Option<Expr> {
@@ -493,6 +530,7 @@ pub fn immutize_array_op(expr: &CallExpr) -> Option<Expr> {
     .and_then(|ident| match ident.sym.as_str() {
       "push" => immutize_push(expr),
       "pop" => immutize_pop(expr),
+      "reverse" | "sort" | "fill" | "copyWithin" => immutize_array_op_by_clone(expr),
       _ => None
     })
 }
@@ -560,6 +598,36 @@ mod tests {
         &immutize_pop(&*parse_expr("a.pop()").as_call().unwrap()).unwrap()),
       swc_ecma_codegen::to_code(
         &*parse_expr("Array.isArray(a) ? (function() {let poped = a[a.length - 1]; a = a.slice(0, -1), setA(a), poped})() : a.pop()"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_reverse() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_array_op_by_clone(&*parse_expr("a.reverse()").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a) ? (a = [...a].reverse(), setA(a), a) : a.reverse()"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_reverse_member() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_array_op_by_clone(&*parse_expr("a.b.reverse()").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a.b) ? (a = {... a, b: [...a.b].reverse()}, setA(a), a.b) : a.b.reverse()"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_fill() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_array_op_by_clone(&*parse_expr("a.fill(0, 1, 2)").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a) ? (a = [...a].fill(0, 1, 2), setA(a), a) : a.fill(0, 1, 2)"),
       ))
   }
 }
