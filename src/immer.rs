@@ -1,7 +1,7 @@
 
 use std::vec;
 
-use swc_core::{atoms::Atom, ecma::ast::{op, ArrayLit, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Callee, ComputedPropName, CondExpr, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function, Ident, IdentName, KeyValueProp, MemberExpr, MemberProp, ObjectLit, ObjectPatProp, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, SeqExpr, SimpleAssignTarget, SpreadElement, Stmt, UnaryExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclarator}, common::{SyntaxContext, DUMMY_SP}};
+use swc_core::{atoms::Atom, common::{Span, SyntaxContext, DUMMY_SP}, ecma::ast::{op, ArrayLit, ArrayPat, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Callee, ComputedPropName, CondExpr, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function, Ident, IdentName, KeyValueProp, MemberExpr, MemberProp, ObjectLit, ObjectPatProp, ParenExpr, Pat, Prop, PropName, PropOrSpread, RestPat, ReturnStmt, SeqExpr, SimpleAssignTarget, SpreadElement, Stmt, UnaryExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclarator}};
 
 use crate::util::{self, find_declared, member_root};
 
@@ -335,7 +335,7 @@ fn iife(block: BlockStmt) -> Expr {
     vec![])
 }
 
-fn var_decl(ident: Ident, init: Expr) -> Decl {
+fn var_decl(name: Pat, init: Expr) -> Decl {
   Decl::Var(Box::new(VarDecl {
     span: DUMMY_SP,
     ctxt: SyntaxContext::empty(),
@@ -343,11 +343,15 @@ fn var_decl(ident: Ident, init: Expr) -> Decl {
     declare: false,
     decls: vec![VarDeclarator {
       span: DUMMY_SP,
-      name: Pat::Ident(BindingIdent { id: ident, type_ann: None }),
+      name: name,
       init: Some(Box::new(init)),
       definite: false,
     }]
   }))
+}
+
+fn var_decl_ident(ident: Ident, init: Expr) -> Decl {
+  var_decl(Pat::Ident(BindingIdent { id: ident, type_ann: None }), init)
 }
 
 fn block(stmts: Vec<Stmt>) -> BlockStmt {
@@ -377,7 +381,7 @@ fn immutize_pop(expr: &CallExpr) -> Option<Expr> {
       Some(is_array_guard(
         &ident.clone().into(),
         &iife(block(vec![
-          var_decl(
+          var_decl_ident(
             tmp.clone(),
             computed_member(ident.clone().into(), bin_op(member(ident.clone().into(), "length".into()), op!(bin, "-"), 1.into()))).into(),
           return_stmt(
@@ -397,7 +401,7 @@ fn immutize_pop(expr: &CallExpr) -> Option<Expr> {
       Some(is_array_guard(
         &obj.clone().into(),
         &iife(block(vec![
-          var_decl(
+          var_decl_ident(
             tmp.clone(),
             computed_member(obj.clone().into(), bin_op(member(obj.clone().into(), "length".into()), op!(bin, "-"), 1.into()))).into(),
           return_stmt(seq(vec![
@@ -462,7 +466,7 @@ fn immutize_shift(expr: &CallExpr) -> Option<Expr> {
       Some(is_array_guard(
         &obj.clone().into(),
         &iife(block(vec![
-          var_decl(
+          var_decl_ident(
             tmp.clone(),
             computed_member(obj.clone().into(), 0.into())).into(),
           return_stmt(
@@ -481,7 +485,7 @@ fn immutize_shift(expr: &CallExpr) -> Option<Expr> {
       Some(is_array_guard(
         &obj.clone().into(),
         &iife(block(vec![
-          var_decl(
+          var_decl_ident(
             tmp.clone(),
             computed_member(obj.clone().into(), 0.into())).into(),
           return_stmt(seq(vec![
@@ -499,15 +503,92 @@ fn immutize_shift(expr: &CallExpr) -> Option<Expr> {
   }
 }
 
+fn pat_array(names: Vec<&str>, rest: Option<&str>) -> Pat {
+  let mut elems: Vec<Option<Pat>> = names.into_iter().map(|x| Some(Pat::Ident(x.into()))).collect();
+  if let Some(name) = rest {
+    elems.push(Some(Pat::Rest(RestPat {span:DUMMY_SP,arg:Box::new(Pat::Ident(name.into())), dot3_token:DUMMY_SP, type_ann:None})))
+  }
+  Pat::Array(ArrayPat { span: DUMMY_SP, optional: false, type_ann: None, elems: elems})
+}
+
+fn identifier(name: &str) -> Ident {
+  Ident::new(name.into(), DUMMY_SP, SyntaxContext::empty())
+}
+
 /*
-  obj.splice(start, delCount, item1, ...items)  =>  Array.isArray(obj) ?
-    let deleted = obj.slice(start, start + delCount),
-    obj = [... obj.slice(0, start), item1, ...items, ...obj.slice(start + delCount)],
-    deleted
-    : obj.splice(start, delCount, ...items)
+  < obj.splice()
+  > obj.splice()
+
+  < obj.splice(args)
+  > Array.isArray(obj)
+  > ? (function() {
+  >   let [start, delCount, ...insert] = args;
+  >   let tmp = obj.slice(start, start + delCount);
+  >   return obj = [... obj.slice(0, start), ...insert, ...obj.slice(start + delCount)], setObj(obj), tmp})()
+  > : obj.splice(args)
 */
-fn immutize_splice(expr: &CallExpr) -> Option<Expr> {
-  todo!()
+fn immutize_splice(call_expr: &CallExpr) -> Option<Expr> {
+  if call_expr.args.len() == 0 {
+    return None
+  }
+  let member_expr = call_expr.callee.as_expr().unwrap().as_member().unwrap();
+  let tmp = Ident::new("tmp".into(), DUMMY_SP, SyntaxContext::empty());
+  match &*member_expr.obj {
+    Expr::Ident(obj) => {
+      Some(is_array_guard(
+        &obj.clone().into(),
+        &iife(block(vec![
+          var_decl(
+            pat_array(vec!["start", "delCount"], Some("insert")),
+            array(call_expr.args.clone())).into(),
+          var_decl_ident(
+            tmp.clone(),
+            call(member(obj.clone().into(), "slice".into()), vec![identifier("start").into(), bin_op(identifier("start").into(), op!(bin, "+"), identifier("delCount").into())])).into(),
+          return_stmt(seq(vec![
+            assign(
+              obj.clone().into(),
+              array(vec![
+                spread_elem(call(member(obj.clone().into(), "slice".into()), vec![Expr::Lit(0.into()).into(), identifier("start").into()])),
+                spread_elem(identifier("insert").into()),
+                spread_elem(call(member(obj.clone().into(), "slice".into()), vec![bin_op(identifier("start").into(), op!(bin, "+"), identifier("delCount").into())])),
+              ])),
+            set_ident(&obj),
+            tmp.into()
+          ])).into()
+        ])),
+        &call_expr.clone().into(),
+      ))
+    }
+    Expr::Member(obj) => {
+      let root = member_root(obj).unwrap();
+      Some(is_array_guard(
+        &obj.clone().into(),
+        &iife(block(vec![
+          var_decl(
+            pat_array(vec!["start", "delCount"], Some("insert")),
+            array(call_expr.args.clone())).into(),
+          var_decl_ident(
+            tmp.clone(),
+            call(member(obj.clone().into(), "slice".into()), vec![identifier("start").into(), bin_op(identifier("start").into(), op!(bin, "+"), identifier("delCount").into())])).into(),
+          return_stmt(seq(vec![
+            assign(
+              root.clone().into(),
+              immutize_member_op(
+                &obj.clone(),
+                array(vec![
+                  spread_elem(call(member(obj.clone().into(), "slice".into()), vec![Expr::Lit(0.into()).into(), identifier("start").into()])),
+                  spread_elem(identifier("insert").into()),
+                  spread_elem(call(member(obj.clone().into(), "slice".into()), vec![bin_op(identifier("start").into(), op!(bin, "+"), identifier("delCount").into())])),
+                ])).unwrap()),
+            set_ident(&root),
+            tmp.into()
+          ])).into()
+        ])),
+        &call_expr.clone().into(),
+      ))
+    }
+    _ => None
+  }
 }
 
 fn seq(exprs: Vec<Expr>) -> Expr {
@@ -575,6 +656,7 @@ pub fn immutize_array_op(expr: &CallExpr) -> Option<Expr> {
       "pop" => immutize_pop(expr),
       "shift" => immutize_shift(expr),
       "unshift" => immutize_unshift(expr),
+      "splice" => immutize_splice(expr),
       "reverse" | "sort" | "fill" | "copyWithin" => immutize_array_op_by_clone(expr),
       _ => None
     })
@@ -723,6 +805,36 @@ mod tests {
         &immutize_array_op_by_clone(&*parse_expr("a.fill(0, 1, 2)").as_call().unwrap()).unwrap()),
       swc_ecma_codegen::to_code(
         &*parse_expr("Array.isArray(a) ? (a = [...a].fill(0, 1, 2), setA(a), a) : a.fill(0, 1, 2)"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_splice() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_splice(&*parse_expr("a.splice(1,2,8,9)").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr(r#"Array.isArray(a)
+        ? (function() {
+            let [start, delCount, ...insert] = [1, 2, 8, 9];
+            let tmp = a.slice(start, start + delCount);
+            return a = [...a.slice(0, start), ...insert, ...a.slice(start + delCount)], setA(a), tmp})()
+        : a.splice(1,2,8,9)"#),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_splice_member() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_splice(&*parse_expr("a.b.splice(...args)").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr(r#"Array.isArray(a.b)
+        ? (function() {
+            let [start, delCount, ...insert] = [...args];
+            let tmp = a.b.slice(start, start + delCount);
+            return a = {...a, b: [...a.b.slice(0, start), ...insert, ...a.b.slice(start + delCount)]}, setA(a), tmp})()
+        : a.b.splice(...args)"#),
       ))
   }
 }
