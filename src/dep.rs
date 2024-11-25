@@ -1,13 +1,22 @@
 use std::cmp::Ordering;
 use swc_core::ecma::ast::{Ident, MemberExpr};
 
-use crate::util::member_expr_to_string;
+use crate::util::{member_expr_to_string, member_root};
 
 
 #[derive(Debug, Clone, Eq)]
 pub enum Dep {
   Ident(Ident),
   MemberExpr(MemberExpr),
+}
+
+impl Dep {
+  pub fn name(&self) -> Option<Ident> {
+    match self  {
+        Dep::Ident(ident) => Some(ident.clone()),
+        Dep::MemberExpr(member_expr) => member_root(member_expr),
+    }
+  }
 }
 
 impl std::hash::Hash for Dep {

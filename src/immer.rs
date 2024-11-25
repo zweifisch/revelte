@@ -1,7 +1,7 @@
 
 use std::vec;
 
-use swc_core::{atoms::Atom, common::{Span, SyntaxContext, DUMMY_SP}, ecma::ast::{op, ArrayLit, ArrayPat, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Callee, ComputedPropName, CondExpr, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function, Ident, IdentName, KeyValueProp, MemberExpr, MemberProp, ObjectLit, ObjectPatProp, ParenExpr, Pat, Prop, PropName, PropOrSpread, RestPat, ReturnStmt, SeqExpr, SimpleAssignTarget, SpreadElement, Stmt, UnaryExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclarator}};
+use swc_core::{atoms::Atom, common::{SyntaxContext, DUMMY_SP}, ecma::ast::{op, ArrayLit, ArrayPat, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, BindingIdent, BlockStmt, CallExpr, Callee, ComputedPropName, CondExpr, Decl, Expr, ExprOrSpread, FnExpr, Function, Ident, IdentName, KeyValueProp, MemberExpr, MemberProp, ObjectLit, ObjectPatProp, ParenExpr, Pat, Prop, PropName, PropOrSpread, RestPat, ReturnStmt, SeqExpr, SimpleAssignTarget, SpreadElement, Stmt, UnaryExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclarator}};
 
 use crate::util::{self, find_declared, member_root};
 
@@ -358,10 +358,6 @@ fn block(stmts: Vec<Stmt>) -> BlockStmt {
   BlockStmt { span: DUMMY_SP, ctxt: SyntaxContext::empty(), stmts: stmts }
 }
 
-fn expr_stmt(expr: Expr) -> ExprStmt {
-  ExprStmt { span: DUMMY_SP, expr: Box::new(expr) }
-}
-
 fn return_stmt(expr: Expr) -> ReturnStmt {
   ReturnStmt { span: DUMMY_SP, arg: Some(Box::new(expr))}
 }
@@ -654,8 +650,8 @@ pub fn immutize_array_op(expr: &CallExpr) -> Option<Expr> {
     .and_then(|ident| match ident.sym.as_str() {
       "push" => immutize_push(expr),
       "pop" => immutize_pop(expr),
-      "shift" => immutize_shift(expr),
       "unshift" => immutize_unshift(expr),
+      "shift" => immutize_shift(expr),
       "splice" => immutize_splice(expr),
       "reverse" | "sort" | "fill" | "copyWithin" => immutize_array_op_by_clone(expr),
       _ => None
@@ -705,6 +701,16 @@ mod tests {
         ).unwrap()),
       swc_ecma_codegen::to_code(
         &*parse_expr("a = {...a, [b]: {... a[b], c: {... a[b].c, ['key']: null}}}, setA(a), a[b].c['key']"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_push0() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_push(&*parse_expr("a.push()").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a) ? (a = [...a], setA(a), a.length) : a.push()"),
       ))
   }
 
@@ -765,6 +771,16 @@ mod tests {
         &immutize_unshift(&*parse_expr("a.unshift(1, 2)").as_call().unwrap()).unwrap()),
       swc_ecma_codegen::to_code(
         &*parse_expr("Array.isArray(a) ? (a = [1, 2, ...a], setA(a), a.length) : a.unshift(1, 2)"),
+      ))
+  }
+
+  #[test]
+  fn immutize_array_unshift0() {
+    assert_eq!(
+      swc_ecma_codegen::to_code(
+        &immutize_unshift(&*parse_expr("a.unshift()").as_call().unwrap()).unwrap()),
+      swc_ecma_codegen::to_code(
+        &*parse_expr("Array.isArray(a) ? (a = [...a], setA(a), a.length) : a.unshift()"),
       ))
   }
 

@@ -8,7 +8,7 @@ use swc_core::{
     atoms::Atom,
     common::{Spanned, SyntaxContext, DUMMY_SP},
     ecma::{
-        ast::{self, BlockStmtOrExpr, Callee, Decl, Expr, ExprOrSpread, Ident, Program },
+        ast::{self, BlockStmtOrExpr, Decl, Expr, ExprOrSpread, Ident, MemberExpr, Program },
         transforms::testing::test_inline,
     visit::{as_folder, FoldWith, VisitMut, VisitMutWith},
 }};
@@ -24,7 +24,8 @@ pub struct TransformVisitor {
     last_deps: HashSet<Dep>,
     states: HashSet<ast::Id>,
     imports: HashSet<String>,
-    member: Option<ast::MemberExpr>,
+    member: Option<MemberExpr>,
+    skip_member: Option<MemberExpr>,
 }
 
 impl TransformVisitor {
@@ -40,6 +41,7 @@ impl TransformVisitor {
             last_deps: HashSet::new(),
             imports: HashSet::new(),
             member: None,
+            skip_member: None,
         }
     }
 
@@ -51,6 +53,15 @@ impl TransformVisitor {
     fn pop_scope(&mut self) {
         self.declared.pop();
         self.last_deps = self.deps.pop().unwrap();
+        let len = self.deps.len();
+        for dep in &self.last_deps {
+            if let Some(ident) = dep.name() {
+                if !self.declared[self.declared.len() - 1].contains(&ident.sym) {
+                    // println!("{:?}", dep.name());
+                    self.deps[len - 1].insert(dep.clone());
+                }
+            }
+        }
         // println!("{:?} {:?}", self.declared.pop(), self.deps.pop());
     }
 
@@ -76,6 +87,18 @@ impl TransformVisitor {
         }
         if self.declared.len() > 1 {
             return self.declared[self.declared.len() - 2].contains(name)
+        }
+        return false
+    }
+
+    fn declared_in_upper_scope(&mut self, name: &Atom) -> bool {
+        if self.current_scope().contains(name) {
+            return false
+        }
+        for i in 1..self.declared.len() - 1 {
+            if self.declared[i].contains(name) {
+                return true
+            }
         }
         return false
     }
@@ -176,8 +199,8 @@ impl TransformVisitor {
 impl VisitMut for TransformVisitor {
 
     fn visit_mut_ident(&mut self, node: &mut Ident) {
-        // println!("{:?}", node.to_id());
-        if self.declared_in_parent_scope(&node.sym.clone()) {
+        // println!("{:?} {:?} {:?}", node.to_id(), self.declared_in_upper_scope(&node.sym), self.declared_in_parent_scope(&node.sym));
+        if self.declared_in_upper_scope(&node.sym) {
             self.add_to_deps(Dep::Ident(node.clone()));
         }
         node.visit_mut_children_with(self);
@@ -186,6 +209,15 @@ impl VisitMut for TransformVisitor {
     fn visit_mut_member_expr(&mut self, node: &mut ast::MemberExpr) {
         if self.member == None {
             self.member = Some(node.clone());
+        }
+        if let Some(member) = &mut self.skip_member {
+            // println!("skip {:?} {:?}", &member, node);
+            if member == node {
+                self.skip_member = None;
+                self.member = None;
+                node.visit_mut_children_with(self);
+                return
+            }
         }
         match &node.prop {
             ast::MemberProp::Computed(prop) => {
@@ -374,6 +406,14 @@ impl VisitMut for TransformVisitor {
     }
 
     fn visit_mut_call_expr(&mut self, node: &mut ast::CallExpr) {
+        if let ast::Callee::Expr(callee) = &mut node.callee {
+            match &mut ** callee {
+                Expr::Member(member) => {
+                    self.skip_member = Some(member.clone());
+                }
+                _ => {}
+            }
+        }
         node.visit_mut_children_with(self);
         if let ast::Callee::Expr(callee) = &mut node.callee {
             match &mut ** callee {
@@ -601,7 +641,7 @@ function App(props) {
       fetch(props.url.toString()).then(x => x.json()).then(val => {
         data = val, setData(data), data;
       })
-    }, [props.url, props.url.toString])
+    }, [props.url])
     return null;
 }"#);
 
@@ -649,4 +689,53 @@ function App() {
     console.log(`count: ${state.count}`)
   }, [state.count])
   return <div onClick={() => (state = {... state, count: state.count + 1}, setState(state), state.count)}>{state.count}</div>
+}"#);
+
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    effect2,
+    r#"function App() {
+  let files = $state({})
+  $effect(() => {
+    files.forEach(console.log)
+  })
+  return null;
+}"#,
+    r#"import { useEffect, useState } from "react";
+function App() {
+    let [files, setFiles] = useState({});
+    useEffect(() => {
+      files.forEach(console.log)
+    }, [files])
+    return null;
+}"#);
+
+test_inline!(
+    Default::default(),
+    |_| as_folder(TransformVisitor::new()),
+    effect3,
+    r#"function App() {
+  let files = $state({})
+  let built = $state({})
+  let ready = $state(false)
+  $effect(() => {
+    if (Object.keys(files).every(k => !!built[k])) {
+        ready = true
+    }
+  })
+  return null;
+}"#,
+    r#"import { useEffect, useState } from "react";
+function App() {
+    let [files, setFiles] = useState({});
+    let [built, setBuilt] = useState({});
+    let [ready, setReady] = useState(false);
+    useEffect(() => {
+        if (Object.keys(files).every(k => !!built[k])) {
+            ready = true, setReady(ready), ready
+        }
+    }, [built, files])
+    return null;
 }"#);
