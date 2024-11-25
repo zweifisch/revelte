@@ -325,7 +325,7 @@ impl VisitMut for TransformVisitor {
                         if let Expr::Call(call_expr) = &mut **expr {
                             if let ast::Callee::Expr(callee) = &mut call_expr.callee {
                                 if let Expr::Ident(callee_ident) = &mut **callee{
-                                    if callee_ident.sym == "$state" && call_expr.args.len() == 1 {
+                                    if callee_ident.sym == "$state" && call_expr.args.len() <= 1 {
                                         self.add_state(ident.id.to_id());
                                         self.imports.insert("useState".into());
                                         decl.name = ast::Pat::Array(ast::ArrayPat {
@@ -346,7 +346,7 @@ impl VisitMut for TransformVisitor {
                                         decl.init = Some(Box::new(Expr::Call(ast::CallExpr {
                                             callee: ast::Callee::Expr(
                                                 Box::new(Expr::Ident(Ident::new("useState".into(), call_expr.span(), SyntaxContext::empty())))),
-                                            args: vec![call_expr.args[0].clone().into()],
+                                            args: call_expr.args.clone().into(),
                                             type_args: None,
                                             span: expr.span(),
                                             ..Default::default()
@@ -453,6 +453,7 @@ impl VisitMut for TransformVisitor {
 
 #[plugin_transform]
 pub fn process_transform(program: Program, _metadata: TransformPluginProgramMetadata) -> Program {
+    // println!("<<=== {:?}", to_code(program.as_module().unwrap()));
     program.fold_with(&mut as_folder(TransformVisitor::new()))
 }
 
@@ -738,4 +739,20 @@ function App() {
         }
     }, [built, files])
     return null;
+}"#);
+
+test_inline!(
+    swc_ecma_parser::Syntax::Typescript(swc_ecma_parser::TsSyntax{
+        ..Default::default()
+    }),
+    |_| as_folder(TransformVisitor::new()),
+    ts, 
+    r#"function App() {
+  let state = $state<number>()
+  return null
+}"#,
+    r#"import { useState } from "react";
+function App() {
+  let [state, setState] = useState()
+  return null
 }"#);
