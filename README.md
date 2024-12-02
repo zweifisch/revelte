@@ -13,6 +13,19 @@ function App() {
   return <div onClick={() => count += 1}>{count}</div>
 }
 ```
+## Why
+
+You get immutable state for free:
+
+```jsx
+state.foo.bar += 1
+```
+
+instead of 
+
+```jsx
+setState({...state, foo: {...state.foo, bar: state.foo.bar + 1}})
+```
 
 ## Setup
 
@@ -38,16 +51,6 @@ npm run dev
 
 - reassigning $state variables, like `count = newVal`
 - mutating object $state variables, like `foo.bar = newVal`
-
-```jsx
-import type {} from 'revelte'
-
-function App() {
-  let count = $state({value: 0})
-  return <div onClick={() => count.value += 1}>{count.value}</div>
-}
-```
-
 - mutating arrays, including `push`, `pop`, `unshift`, `shift`, `splice`, `fill`, `reverse`, `sort` and `copyWithin`
 - always operate directly on the original $state object, otherwise state won't change
 
